@@ -31,7 +31,7 @@ class LLMClient:
         self.provider_url = provider_url
         self.model_name = model_name
 
-    def call_api(self, question_str: str) -> Dict[str, Any]:
+    def call_api(self, messages: list[dict[str, str]]) -> Dict[str, Any]:
         """Execute API call with fallback key rotation on rate limits."""
         for _ in range(len(self.rotator.api_key)):
             client = OpenAI(
@@ -41,7 +41,7 @@ class LLMClient:
             try:
                 response = client.chat.completions.create(
                     model=self.model_name,
-                    messages=[{"role": "user", "content": question_str}],
+                    messages=messages
                 )
 
                 # Extract content and tracking metrics for subject requirements
