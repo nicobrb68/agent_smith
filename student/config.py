@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field
 from typing import List
 
+
 class SandboxConfig(BaseModel):
     """Configuration de la sandbox pour les solutions étudiantes.
     Approche par allowlist : seuls les modules autorisés peuvent être importés.
