@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Tuple
 
 from pydantic import ValidationError
 from student.agent_config import AgentConfig
+from dotenv import load_dotenv
+load_dotenv()
 
 
 class AgentMbpp:
@@ -60,8 +62,18 @@ class AgentMbpp:
                 f"{template_path} not found. Using default sandbox limits."
             )
             sandbox_config = SandboxConfig()
+        # On récupère plusieurs clés depuis l'environnement pour la rotation
+        api_keys: List[str] = []
 
-        api_keys: List[str] = [os.getenv("OPENAI_API_KEY", "dummy")]
+        for i in range(1, 4):
+            key = os.getenv(f"AGENT_KEY_{i}")
+            if key:
+                api_keys.append(key)
+
+        if not api_keys:
+            default_key = os.getenv("OPENAI_API_KEY")
+            api_keys = [default_key] if default_key else ["dummy"]
+
         rotator: TokenRotator = TokenRotator(api_keys)
         llm: LLMClient = LLMClient(
             rotator, self.config.provider_url, self.config.model_name
