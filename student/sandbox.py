@@ -91,13 +91,19 @@ class Sandbox:
         if process.is_alive():
             process.terminate()
             process.join()
-            return (
-                "Timeout Error: Code execution exceeded the time limit"
-                " or an infinite loop has been created"
-            )
+            return {
+                "success": False,
+                "output": "Timeout Error, an infinity loop is suspected"
+            }
 
         # No timeout, retrieve output
         if not queue.empty():
             resultat = queue.get()
-            return str(resultat["output"])
-        return "Unknown Error: No output recorded"
+            return {
+                "success": resultat["success"],
+                "output": str(resultat["output"])
+            }
+        return {
+            "success": False,
+            "output": "Unknown Error: No output recorded"
+        }
