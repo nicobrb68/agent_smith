@@ -7,7 +7,7 @@ import socket
 import sys
 from typing import Any, Dict
 
-from student.config import SandboxConfig
+from student.sandbox_config import SandboxConfig
 from student.errors import ForbiddenNetworkError, UnauthorizedImportError
 
 
