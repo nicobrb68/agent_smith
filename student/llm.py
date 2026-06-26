@@ -1,6 +1,7 @@
 import openai
 from openai import OpenAI
 from typing import Any, Dict
+import sys
 
 
 class TokenRotator:
@@ -68,4 +69,5 @@ class LLMClient:
                 self.rotator.rotate_key()
 
         # Raised if all available tokens in the loop failed
-        raise RuntimeError("All provided API tokens have failed or exhausted.")
+        print("All provided API tokens have failed or exhausted.\nEnd of program.")
+        sys.exit(1)

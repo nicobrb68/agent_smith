@@ -69,13 +69,14 @@ class Sandbox:
                 builtins_dict = sys.modules["builtins"].__dict__
                 exec(code_str, {"__builtins__": builtins_dict})
                 queue.put({"success": True, "output": get_print.getvalue()})
-            except Exception as e:
+            except BaseException as e:
+                is_system_exit = isinstance(e, SystemExit)
                 queue.put(
                     {
                         "success": False,
                         "output": (
-                            f"{get_print.getvalue()}\n"
-                            f"{type(e).__name__}: {e}"
+                            f"{get_print.getvalue()}"
+                            f"{'' if is_system_exit else f'{type(e).__name__}: {e}'}"
                         ),
                     }
                 )
