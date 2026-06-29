@@ -106,7 +106,7 @@ class AgentSWEBench:
                 )
             with open(self.config.output, "w", encoding="utf-8") as f:
                 json.dump(output_data, f, indent=4)
-            print(f"🎉 Process finished. Output saved to {self.config.output}")
+            print(f"Process finished. Output saved to {self.config.output}")
 
         except OSError as e:
             print(
@@ -206,17 +206,27 @@ class AgentSWEBench:
     def solve(self) -> None:
         """Orchestrate loading, engineering loop, and report saving."""
         llm, mcp_client = self._init_tools()
+        server_params = StdioServerParameters(
+            command="python",
+            args=["-m", "student.mcp_tools_swebench"],
+        )
+        start_agent : float = 0.0
 
-        start_agent: float = time.time()
-        (
-            success,
-            final_patch,
-            prompt_tokens,
-            completion_tokens,
-            steps,
-        ) = self._run_evaluation_loop(llm, mcp_client)
-        end_agent: float = time.time()
-        total_time: float = end_agent - start_agent
+        with stdio_client(server_params) as (read_stream, write_stream):
+            with ClientSession(read_stream, write_stream) as session:
+                session.initialize()
+                available_tools = session.list_tools()
+
+                start_agent = time.time()
+                (
+                    success,
+                    final_patch,
+                    prompt_tokens,
+                    completion_tokens,
+                    steps,
+                ) = self._run_evaluation_loop(llm, session)
+                end_agent: float = time.time()
+                total_time: float = end_agent - start_agent
 
         self._save_report(
             success,

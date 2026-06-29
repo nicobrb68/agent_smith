@@ -1,5 +1,6 @@
 from mcp.server.fastmcp import FastMCP
-
+import os
+import subprocess
 
 
 
@@ -69,3 +70,29 @@ def search_grep(pattern: str) -> str:
                 except OSError:
                     continue
     return "\n".join(results) if results else "No matches found."
+
+
+@mcp.tool()
+def run_test(command: str) -> str:
+    """
+    Execute a test command in the project environment and return the output.
+
+    Args:
+        command (str): The full shell command to run the tests.
+
+    Returns:
+        str: The stdout and stderr output from the test execution.
+    """
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        return f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    except subprocess.TimeoutExpired:
+        return "Error: Test execution timed out after 60 seconds."
+    except Exception as e:
+        return f"Error executing tests: {str(e)}"
