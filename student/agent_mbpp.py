@@ -31,7 +31,7 @@ class AgentMbpp:
         self.tests: List[str] = list(task_data.get("test_list", []))
         self.function_definition : str = str(task_data.get("function_definition", ""))
 
-        # We keep the full system prompt handy for the final report
+        # we keep the full system prompt handy for the final report
         self.system_prompt: str = (
             "You are a Python expert. Write only the requested function. "
             "Do not provide any explanations, no markdown code blocks, "

@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from student.sandbox import Sandbox
 from student.sandbox_config import SandboxConfig
 
-# 1. Initialize the FastMCP server at the global module level
+
 mcp = FastMCP("MBPP Sandbox Server")
 
 
@@ -49,7 +49,6 @@ def _init_sandbox() -> Sandbox:
     return Sandbox(sandbox_config)
 
 
-# 2. Declare the tool at the global level for FastMCP inspection
 @mcp.tool()
 def execute_python_code(code: str) -> str:
     """
@@ -68,6 +67,5 @@ def execute_python_code(code: str) -> str:
     return str(result.get("output", ""))
 
 
-# 3. Main entry point to run the MCP server over standard I/O
 if __name__ == "__main__":
     mcp.run()
