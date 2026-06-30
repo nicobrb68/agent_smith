@@ -32,7 +32,11 @@ class LLMClient:
         self.provider_url = provider_url
         self.model_name = model_name
 
-    def call_api(self, messages: list[dict[str, str]]) -> Dict[str, Any]:
+    def call_api(
+        self, 
+        messages: list[dict[str, str]], 
+        tools: list[dict[str, Any]] | None = None
+    ) -> Dict[str, Any]:
         """Execute API call with fallback key rotation on rate limits."""
         for _ in range(len(self.rotator.api_key)):
             client = OpenAI(
@@ -40,13 +44,18 @@ class LLMClient:
                 api_key=self.rotator.get_current_key(),
             )
             try:
-                response = client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages
-                )
+                kwargs = {
+                    "model": self.model_name,
+                    "messages": messages
+                }
+                if tools:
+                    kwargs["tools"] = tools
+                response = client.chat.completions.create(**kwargs)
 
-                # Extract content and tracking metrics for subject requirements
-                answer_text = response.choices[0].message.content
+                message = response.choices[0].message
+                answer_text = message.content or ""
+                tool_calls = message.tool_calls if hasattr(message, "tool_calls") else None
+
                 prompt_tokens = (
                     response.usage.prompt_tokens if response.usage else 0
                 )
@@ -56,6 +65,7 @@ class LLMClient:
 
                 return {
                     "text": answer_text,
+                    "tool_calls": tool_calls,
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                 }

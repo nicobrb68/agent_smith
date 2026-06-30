@@ -139,7 +139,26 @@ class AgentSWEBench:
             print(f"--- SWE-bench Attempt {attempt} / 30 ---")
 
             start_api: float = time.time()
-            api_answer: Dict[str, Any] = llm.call_api(messages_context)
+            openai_tools = []
+
+            if mcp_client and hasattr(mcp_client, "tools"):
+                for tool in mcp_client.tools:
+                    
+                    dic = {
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.inputSchema,
+                        },
+                    }
+                    openai_tools.append(dic)
+            else:
+                openai_tools = None
+
+            api_answer = llm.call_api(messages_context, tools=openai_tools)
+            
+            # calculate time of answer
             end_api: float = time.time()
             request_time_ms: float = (end_api - start_api) * 1000
 
@@ -149,14 +168,58 @@ class AgentSWEBench:
             total_prompt_tokens += step_input_tokens
             total_completion_tokens += step_output_tokens
 
-            # SWE-bench broad limits: 300k input / 50k output
+            # check limits
             if total_prompt_tokens > 300000 or total_completion_tokens > 50000:
                 print("Hard limits exceeded (Tokens)! Stopping agent.")
                 break
 
+            # llm want to call a tool
+            if api_answer.get("tool_calls"):
+                for tool_call in api_answer["tool_calls"]:
+                    name = tool_call.function.name
+                    args = json.loads(tool_call.function.arguments)
+
+                    try:
+                        mcp_response = mcp_client.call_tool(name, arguments=args)
+                        tool_result = mcp_response.content[0].text
+                    except Exception as e:
+                        tool_result = f"Error executing tool: {str(e)}"
+
+                    messages_context.append({
+                        "role": "assistant",
+                        "content": api_answer.get("text", ""),
+                        "tool_calls": [tool_call]
+                    })
+                    messages_context.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": name,
+                        "content": tool_result
+                    })
+
+                steps.append(
+                    {
+                        "step": attempt,
+                        "input_tokens": step_input_tokens,
+                        "output_tokens": step_output_tokens,
+                        "request_time_ms": request_time_ms,
+                        "timestamp": datetime.now().isoformat(),
+                        "api_url": self.config.provider_url,
+                        "model_name": self.config.model_name,
+                        "llm_output": f"[Tool Call] {name}",
+                        "sandbox_input": str(args),
+                        "sandbox_output": str(tool_result),
+                        "retries": 0,
+                    }
+                )
+                continue
+
+            end_api: float = time.time()
+            request_time_ms: float = (end_api - start_api) * 1000
+
             final_patch = api_answer.get("text", "")
 
-            # Temporary extraction layer for git diff formatting
+            # temporary extraction layer for git diff formatting
             if "```diff" in final_patch:
                 final_patch = final_patch.split("```diff")[1].split("```")[0]
             elif "```" in final_patch:
@@ -164,7 +227,6 @@ class AgentSWEBench:
 
             final_patch = final_patch.strip()
 
-            # Temporary success criterion before tool integration
             success = "diff --git" in final_patch
 
             steps.append(
@@ -182,7 +244,7 @@ class AgentSWEBench:
                     "retries": 0,
                 }
             )
-
+            # check succes or no
             if success is True:
                 print("✅ Patch file generated successfully!")
                 break
