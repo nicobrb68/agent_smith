@@ -1,0 +1,17 @@
+{
+  "authorized_imports": [
+    "math",
+    "re",
+    "json",
+    "typing",
+    "collections",
+    "itertools",
+    "sys"
+  ],
+  "allowed_directories": [
+    "/testbed",
+    "/tmp/agent"
+  ],
+  "max_execution_time_seconds": 30,
+  "max_memory_mb": 2048
+}

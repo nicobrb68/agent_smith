@@ -13,4 +13,5 @@ __pycache__/
 .env
 .moulinette_cache/
 cache/
-*.json
+# Dépôts SWE-bench clonés dynamiquement par l'agent
+sympy/

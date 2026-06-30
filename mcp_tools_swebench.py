@@ -2,97 +2,158 @@ from mcp.server.fastmcp import FastMCP
 import os
 import subprocess
 
-
-
-
 mcp = FastMCP("SWE-Bench Tools Server")
 
+
 @mcp.tool()
-def view_file(file_path : str) -> str:
+def read_file(filepath: str, start_line: int, end_line: int) -> str:
     """
-    Read and return the entire content of a file.
+    Read the content of a file with line numbers, similar to cat -n.
 
     Args:
-        file_path (str): The relative path to the file to read.
-
-    Returns:
-        str: The content of the file or an error message.
+        filepath (str): The path to the file to read.
+        start_line (int): The 1-indexed starting line number.
+        end_line (int): The 1-indexed ending line number.
     """
     try:
-        with open(file_path, encoding="utf-8") as f:
-            file_str: str = f.read()
+        with open(filepath, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        start = max(0, int(start_line) - 1)
+        end = min(len(lines), int(end_line))
+        
+        output_lines = []
+        for idx, line in enumerate(lines[start:end], start=start + 1):
+            output_lines.append(f"{idx}: {line.rstrip()}")
+            
+        return "\n".join(output_lines) if output_lines else "Empty range or file."
     except OSError as e:
-        return str(e)
-    return file_str
+        return f"Error reading file: {str(e)}"
 
 
 @mcp.tool()
-def save_file(file_path: str, edit_content: str) -> str:
+def edit_file(filepath: str, old_str: str, new_str: str) -> str:
     """
-    Write or overwrite content into a specified file.
+    Replace an exact string in a file with a new string.
 
     Args:
-        file_path (str): The relative path to the file to write.
-        edit_content (str): The full text content to insert into the file.
-
-    Returns:
-        str: A success message or an error message if the operation fails.
+        filepath (str): The path to the file to modify.
+        old_str (str): The exact block of text to replace.
+        new_str (str): The new text to insert instead.
     """
     try:
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(edit_content)
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+            
+        if old_str not in content:
+            return f"Error: Could not find the exact 'old_str' in {filepath}. Modification aborted."
+            
+        new_content = content.replace(old_str, new_str)
+        
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(new_content)
+            
+        return "File edited successfully."
     except OSError as e:
-        return str(e)
-    return "File written successfully"
+        return f"Error editing file: {str(e)}"
 
 
 @mcp.tool()
-def search_grep(pattern: str) -> str:
+def list_files(directory: str = ".", pattern: str = "*") -> str:
     """
-    Search for a text pattern recursively in all files within the project.
-
-    Args:
-        pattern (str): The string or code snippet to search for.
-
-    Returns:
-        str: A formatted list of matches with file paths and line numbers.
+    List files in a directory matching a given pattern.
     """
-    results: list[str] = []
+    import fnmatch
+    results = []
+    try:
+        for root, dirs, files in os.walk(directory):
+            for file in files:
+                if fnmatch.fnmatch(file, pattern):
+                    results.append(os.path.join(root, file))
+        return "\n".join(results) if results else "No files found matching pattern."
+    except Exception as e:
+        return f"Error listing files: {str(e)}"
+
+
+@mcp.tool()
+def search_code(pattern: str, file_pattern: str = "*.py") -> str:
+    """
+    Perform a grep-like search in the codebase.
+    Format: /absolute/path_to_file.py: <line_number> <line_content>
+    """
+    import fnmatch
+    results = []
     for root, dirs, files in os.walk("."):
         for file in files:
-            if file.endswith(".py"):
+            if fnmatch.fnmatch(file, file_pattern):
                 full_path = os.path.join(root, file)
+                abs_path = os.path.abspath(full_path)
                 try:
                     with open(full_path, "r", encoding="utf-8") as f:
                         for line_num, line in enumerate(f, 1):
                             if pattern in line:
-                                results.append(f"{full_path}:{line_num}:{line.strip()}")
+                                results.append(f"{abs_path}: {line_num} {line.strip()}")
                 except OSError:
                     continue
     return "\n".join(results) if results else "No matches found."
 
 
 @mcp.tool()
-def run_test(command: str) -> str:
+def run_tests() -> str:
     """
-    Execute a test command in the project environment and return the output.
-
-    Args:
-        command (str): The full shell command to run the tests.
-
-    Returns:
-        str: The stdout and stderr output from the test execution.
+    Execute the evaluation test suite command for the repository.
     """
+    # On se base sur le script d'évaluation ou la commande générique du projet
+    # Pour SymPy par exemple : bin/test
+    cmd = "bin/test" if os.path.exists("bin/test") else "pytest"
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
         return f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     except subprocess.TimeoutExpired:
         return "Error: Test execution timed out after 60 seconds."
     except Exception as e:
         return f"Error executing tests: {str(e)}"
+
+
+@mcp.tool()
+def get_patch() -> str:
+    """
+    Retrieve the unified git diff of all changes made to the repository.
+    Strictly uses the flags demanded by the subject contract.
+    """
+    try:
+        result = subprocess.run(
+            "git -c core.fileMode=false diff",
+            shell=True,
+            capture_output=True,
+            text=True
+        )
+        return result.stdout if result.stdout else "No changes made yet (empty diff)."
+    except Exception as e:
+        return f"Error getting patch: {str(e)}"
+
+
+@mcp.tool()
+def run_command(command: str, workdir: str = ".") -> str:
+    """
+    Execute a shell command in the specified working directory.
+    Returns the command's stdout, stderr, and exit code.
+    """
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        return f"EXIT CODE: {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    except subprocess.TimeoutExpired:
+        return "Error: Command timed out after 60 seconds."
+    except Exception as e:
+        return f"Error executing command: {str(e)}"
+
+
+if __name__ == "__main__":
+    mcp.run()

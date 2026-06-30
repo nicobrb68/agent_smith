@@ -79,5 +79,5 @@ class LLMClient:
                 self.rotator.rotate_key()
 
         # Raised if all available tokens in the loop failed
-        print("All provided API tokens have failed or exhausted.\nEnd of program.")
-        sys.exit(1)
+        print("All provided API tokens have failed or exhausted.")
+        raise RuntimeError("LLM_API_EXHAUSTED: All provided API tokens have failed or exhausted.")

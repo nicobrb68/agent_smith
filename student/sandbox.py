@@ -5,10 +5,13 @@ import multiprocessing
 import resource
 import socket
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, Callable
 
 from student.sandbox_config import SandboxConfig
-from student.errors import ForbiddenNetworkError, UnauthorizedImportError
+from student.errors import ForbiddenNetworkError, UnauthorizedImportError, FinalAnswerException
+
+
+
 
 
 class Sandbox:
@@ -56,55 +59,87 @@ class Sandbox:
 
         socket.socket = forbidden_socket
 
-    def execute_code(self, code_str: str) -> str:
-        """Execute the AI code and return its output (stdout/stderr)."""
+    def execute_code(self, code_str: str, injected_tools: Dict[str, Callable] | None = None) -> Dict[str, Any]:
+        """
+        Execute the AI code and return its output along with execution flags.
+        Supports injecting custom Python functions (like MCP tools and final_answer).
+        """
         queue: multiprocessing.Queue[Dict[str, Any]] = multiprocessing.Queue()
+        tools_to_inject = injected_tools or {}
 
         def agent_routine() -> None:
             self._apply_restrictions()
             get_print = io.StringIO()
             sys.stdout = get_print
             sys.stderr = get_print
+            
+            # 1. Préparation de l'espace de nom (Namespace) d'exécution
+            builtins_dict = sys.modules["builtins"].__dict__
+            execution_globals = {"__builtins__": builtins_dict}
+            
+            # 2. Injection dynamique des fonctions outils MCP transmises par l'agent
+            for tool_name, tool_func in tools_to_inject.items():
+                execution_globals[tool_name] = tool_func
+                
+            # 3. Injection native de la fonction obligatoire final_answer()
+            def final_answer(answer_string: str) -> None:
+                # On lève une exception dédiée pour couper le exec() et transmettre la réponse
+                raise FinalAnswerException(str(answer_string))
+                
+            execution_globals["final_answer"] = final_answer
+
             try:
-                builtins_dict = sys.modules["builtins"].__dict__
-                exec(code_str, {"__builtins__": builtins_dict})
-                queue.put({"success": True, "output": get_print.getvalue()})
+                exec(code_str, execution_globals)
+                queue.put({
+                    "success": True, 
+                    "is_final": False, 
+                    "output": get_print.getvalue(),
+                    "solution": ""
+                })
+            except FinalAnswerException as fae:
+                # L'IA a appelé final_answer() avec succès !
+                queue.put({
+                    "success": True, 
+                    "is_final": True, 
+                    "output": get_print.getvalue(),
+                    "solution": fae.answer
+                })
             except BaseException as e:
-                is_system_exit = isinstance(e, SystemExit)
-                queue.put(
-                    {
-                        "success": False,
-                        "output": (
-                            f"{get_print.getvalue()}"
-                            f"{'' if is_system_exit else f'{type(e).__name__}: {e}'}"
-                        ),
-                    }
-                )
+                # Gestion des interruptions systèmes requises par le sujet
+                if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                    raise e
+                queue.put({
+                    "success": False,
+                    "is_final": False,
+                    "output": (
+                        f"{get_print.getvalue()}"
+                        f"{type(e).__name__}: {e}"
+                    ),
+                    "solution": ""
+                })
 
-        # Create child process with target function
+        # Création et lancement du processus enfant
         process = multiprocessing.Process(target=agent_routine)
-
-        # Launch child process
         process.start()
         process.join(timeout=float(self.config.max_execution_time_seconds))
 
-        # Clean infinite loops
+        # Sécurité anti-boucle infinie
         if process.is_alive():
             process.terminate()
             process.join()
             return {
                 "success": False,
-                "output": "Timeout Error, an infinity loop is suspected"
+                "is_final": False,
+                "output": "Timeout Error: Execution exceeded limit.",
+                "solution": ""
             }
 
-        # No timeout, retrieve output
         if not queue.empty():
-            resultat = queue.get()
-            return {
-                "success": resultat["success"],
-                "output": str(resultat["output"])
-            }
+            return queue.get()
+            
         return {
             "success": False,
-            "output": "Unknown Error: No output recorded"
+            "is_final": False,
+            "output": "Unknown Error: No output recorded",
+            "solution": ""
         }
