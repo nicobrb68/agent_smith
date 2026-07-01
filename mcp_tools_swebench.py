@@ -1,9 +1,11 @@
 from mcp.server.fastmcp import FastMCP
 import os
 import subprocess
+import fnmatch  # Déplacé ici pour éviter les imports dynamiques
 
 mcp = FastMCP("SWE-Bench Tools Server")
 
+# === V.5.1 FILE SYSTEM TOOLS ===
 
 @mcp.tool()
 def read_file(filepath: str, start_line: int, end_line: int) -> str:
@@ -63,7 +65,6 @@ def list_files(directory: str = ".", pattern: str = "*") -> str:
     """
     List files in a directory matching a given pattern.
     """
-    import fnmatch
     results = []
     try:
         for root, dirs, files in os.walk(directory):
@@ -75,13 +76,14 @@ def list_files(directory: str = ".", pattern: str = "*") -> str:
         return f"Error listing files: {str(e)}"
 
 
+# === V.5.2 CODE SEARCH TOOLS ===
+
 @mcp.tool()
 def search_code(pattern: str, file_pattern: str = "*.py") -> str:
     """
     Perform a grep-like search in the codebase.
     Format: /absolute/path_to_file.py: <line_number> <line_content>
     """
-    import fnmatch
     results = []
     for root, dirs, files in os.walk("."):
         for file in files:
@@ -98,13 +100,13 @@ def search_code(pattern: str, file_pattern: str = "*.py") -> str:
     return "\n".join(results) if results else "No matches found."
 
 
+# === V.5.3 EXECUTION TOOLS ===
+
 @mcp.tool()
 def run_tests() -> str:
     """
     Execute the evaluation test suite command for the repository.
     """
-    # On se base sur le script d'évaluation ou la commande générique du projet
-    # Pour SymPy par exemple : bin/test
     cmd = "bin/test" if os.path.exists("bin/test") else "pytest"
     try:
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
@@ -153,6 +155,46 @@ def run_command(command: str, workdir: str = ".") -> str:
         return "Error: Command timed out after 60 seconds."
     except Exception as e:
         return f"Error executing command: {str(e)}"
+
+@mcp.tool()
+def run_eval_script(script_content: str, repo_dir: str) -> str:
+    """
+    Exécute le script d'évaluation officiel fourni par le benchmark
+    au sein du dépôt pour garantir la conformité de l'environnement.
+    """
+    script_path = os.path.join(repo_dir, "run_eval_generated.sh")
+    
+    # 1. On écrit le script brut dans un fichier shell
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(script_content)
+        
+    # 2. On rend le script exécutable
+    os.chmod(script_path, 0o755)
+    
+    try:
+        # 3. On l'exécute à l'intérieur du dossier du dépôt avec /bin/bash
+        result = subprocess.run(
+            ["/bin/bash", "./run_eval_generated.sh"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+        
+        # Nettoyage
+        if os.path.exists(script_path):
+            os.remove(script_path)
+            
+        return f"EXIT CODE: {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        
+    except subprocess.TimeoutExpired:
+        if os.path.exists(script_path):
+            os.remove(script_path)
+        return "Error: Test execution timed out after 120 seconds."
+    except Exception as e:
+        if os.path.exists(script_path):
+            os.remove(script_path)
+        return f"Error executing eval script: {str(e)}"
 
 
 if __name__ == "__main__":

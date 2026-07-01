@@ -82,10 +82,8 @@ class AgentMbpp:
             default_key = os.getenv("OPENAI_API_KEY")
             api_keys = [default_key] if default_key else ["dummy"]
 
-        rotator: TokenRotator = TokenRotator(api_keys)
-        llm: LLMClient = LLMClient(
-            rotator, self.config.provider_url, self.config.model_name
-        )
+        rotator = TokenRotator() # Il s'occupe de tout charger tout seul de manière abstraite
+        llm = LLMClient(rotator, self.config.provider_url, self.config.model_name)
 
         sandbox: Sandbox = Sandbox(sandbox_config)
 

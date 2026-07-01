@@ -1,83 +1,99 @@
+import os
 import openai
 from openai import OpenAI
-from typing import Any, Dict
-import sys
-
+from typing import Any, Dict, List
 
 class TokenRotator:
-    """Manages API token rotation to handle rate limits and quotas."""
+    """Gère la rotation automatique multi-clés et multi-providers de manière abstraite."""
 
-    def __init__(self, keys: list[str]) -> None:
-        """Initialize the rotator with a list of API keys."""
-        self.api_key = keys
+    def __init__(self) -> None:
+        self.configs: List[Dict[str, str]] = []
         self.current_index = 0
+        self._load_providers()
 
-    def get_current_key(self) -> str:
-        """Return the active API key."""
-        return self.api_key[self.current_index]
+    def _load_providers(self) -> None:
+        """Détecte dynamiquement les providers configurés dans le .env."""
+        providers = ["GROQ", "OPENROUTER", "GEMINI"]
+        
+        for p in providers:
+            url = os.getenv(f"{p}_API_URL")
+            model = os.getenv(f"{p}_MODEL_NAME")
+            keys_raw = os.getenv(f"{p}_KEYS")
+            
+            if url and model and keys_raw:
+                keys = [k.strip() for k in keys_raw.split(",") if k.strip()]
+                for key in keys:
+                    self.configs.append({
+                        "url": url,
+                        "model": model,
+                        "key": key
+                    })
+                    
+        if not self.configs:
+            self.configs.append({
+                "url": "[https://api.groq.com/openai/v1](https://api.groq.com/openai/v1)",
+                "model": "llama-3.3-70b-versatile",
+                "key": "dummy"
+            })
 
-    def rotate_key(self) -> None:
-        """Switch to the next available API key."""
-        self.current_index = (self.current_index + 1) % len(self.api_key)
+    def get_current_config(self) -> Dict[str, str]:
+        """Retourne la configuration active (URL, Clé, Modèle)."""
+        return self.configs[self.current_index]
+
+    def rotate(self) -> None:
+        """Passe à la clé suivante (ou au provider suivant) en cas de fail."""
+        if len(self.configs) > 1:
+            self.current_index = (self.current_index + 1) % len(self.configs)
 
 
 class LLMClient:
-    """Handles OpenAI-compatible API calls with integrated token rotation."""
+    """Client OpenAI-compatible avec tolérance aux pannes et abstraction des providers."""
 
-    def __init__(
-        self, rotator: TokenRotator, provider_url: str, model_name: str
-    ) -> None:
-        """Initialize the client with a rotator and provider configuration."""
+    def __init__(self, rotator: TokenRotator, provider_url: str, model_name: str) -> None:
         self.rotator = rotator
-        self.provider_url = provider_url
-        self.model_name = model_name
+        self.cli_url = provider_url
+        self.cli_model = model_name
 
-    def call_api(
-        self, 
-        messages: list[dict[str, str]], 
-        tools: list[dict[str, Any]] | None = None
-    ) -> Dict[str, Any]:
-        """Execute API call with fallback key rotation on rate limits."""
-        for _ in range(len(self.rotator.api_key)):
-            client = OpenAI(
-                base_url=self.provider_url,
-                api_key=self.rotator.get_current_key(),
-            )
+    def call_api(self, messages: List[Dict[str, str]], tools: Any = None) -> Dict[str, Any]:
+        """Exécute l'appel API en testant les configurations du rotator jusqu'à épuisement."""
+        
+        for _ in range(len(self.rotator.configs)):
+            config = self.rotator.get_current_config()
+            
+            is_cli_compatible = True
+            if self.cli_url and "groq" in self.cli_url.lower() and config["key"].startswith("sk-or"):
+                is_cli_compatible = False
+            elif self.cli_url and "openrouter" in self.cli_url.lower() and config["key"].startswith("gsk_"):
+                is_cli_compatible = False
+            elif config["key"].startswith("AIza"):
+                is_cli_compatible = False
+
+            if self.rotator.current_index == 0 and is_cli_compatible:
+                base_url = self.cli_url if self.cli_url else config["url"]
+                model_to_use = self.cli_model if self.cli_model else config["model"]
+            else:
+                base_url = config["url"]
+                model_to_use = config["model"]
+            
+            client = OpenAI(base_url=base_url, api_key=config["key"])
+            
             try:
-                kwargs = {
-                    "model": self.model_name,
-                    "messages": messages
-                }
+                kwargs = {"model": model_to_use, "messages": messages}
                 if tools:
                     kwargs["tools"] = tools
+                    
                 response = client.chat.completions.create(**kwargs)
-
-                message = response.choices[0].message
-                answer_text = message.content or ""
-                tool_calls = message.tool_calls if hasattr(message, "tool_calls") else None
-
-                prompt_tokens = (
-                    response.usage.prompt_tokens if response.usage else 0
-                )
-                completion_tokens = (
-                    response.usage.completion_tokens if response.usage else 0
-                )
-
+                
                 return {
-                    "text": answer_text,
-                    "tool_calls": tool_calls,
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
+                    "text": response.choices[0].message.content or "",
+                    "tool_calls": getattr(response.choices[0].message, "tool_calls", None),
+                    "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
+                    "completion_tokens": response.usage.completion_tokens if response.usage else 0,
                 }
-
+                
             except (openai.RateLimitError, openai.OpenAIError) as e:
-                current_key = self.rotator.get_current_key()
-                print(
-                    f"Token error on {current_key}: {e}\n"
-                    "Trying another one..."
-                )
-                self.rotator.rotate_key()
+                print(f"\n⚠️ Échec avec le Provider {base_url} (Modèle: {model_to_use}) : {e}")
+                print("🔄 Rotation automatique vers la configuration suivante...")
+                self.rotator.rotate()
 
-        # Raised if all available tokens in the loop failed
-        print("All provided API tokens have failed or exhausted.")
-        raise RuntimeError("LLM_API_EXHAUSTED: All provided API tokens have failed or exhausted.")
+        raise RuntimeError("LLM_API_EXHAUSTED: Toutes les clés de tous les providers ont échoué ou sont saturées.")

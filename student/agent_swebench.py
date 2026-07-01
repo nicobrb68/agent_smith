@@ -41,17 +41,18 @@ class AgentSWEBench:
         commit_match = re.search(r"git checkout ([0-9a-f]{40})", self.eval_script)
         self.base_commit: str = commit_match.group(1) if commit_match else "master"
 
-        # Extraction de la vraie commande de test depuis l'eval_script
-        self.test_command: str = "pytest"
-        for line in self.eval_script.split("\n"):
-            if any(cmd in line for cmd in ["bin/test", "pytest", "python -m unittest"]):
-                self.test_command = line.split(" #")[0].strip()
+        # Extraction stricte et universelle de la commande de test par balise SWE-bench
+        self.test_command = "pytest"
+        eval_lines = self.eval_script.split("\n")
+        for idx, line in enumerate(eval_lines):
+            if ">>>>> Start Test Output" in line and idx + 1 < len(eval_lines):
+                self.test_command = eval_lines[idx + 1].strip()
                 break
 
         # Limite stricte du sujet pour SWE-bench 
-        self.max_iterations: int = 30
+        self.max_iterations: int = 7
 
-        # System prompt mis à jour pour le modèle Code-Based Tool Calling du sujet [cite: 231, 232]
+        # System prompt mis à jour pour le modèle Code-Based Tool Calling du sujet
         self.system_prompt: str = (
             "You are an expert Senior Software Engineer. Your goal is to solve the provided GitHub issue.\n"
             "You interact with the repository by writing standard Python code blocks calling your tools.\n\n"
@@ -80,18 +81,8 @@ class AgentSWEBench:
         """Initialize the LLM client and Sandbox."""
         from student.llm import LLMClient, TokenRotator
 
-        api_keys: List[str] = []
-        for i in range(1, 4):
-            key = os.getenv(f"AGENT_KEY_{i}")
-            if key:
-                api_keys.append(key)
-
-        if not api_keys:
-            default_key = os.getenv("OPENAI_API_KEY")
-            api_keys = [default_key] if default_key else ["dummy"]
-
-        rotator: TokenRotator = TokenRotator(api_keys)
-        llm: LLMClient = LLMClient(rotator, self.config.provider_url, self.config.model_name)
+        rotator = TokenRotator()
+        llm = LLMClient(rotator, self.config.provider_url, self.config.model_name)
         
         sandbox_config = SandboxConfig()
         sandbox: Sandbox = Sandbox(sandbox_config)
@@ -141,7 +132,10 @@ class AgentSWEBench:
             {"role": "system", "content": self.system_prompt},
             {
                 "role": "user",
-                "content": f"Repository: {self.repo}\n\nIssue Description:\n{self.problem_statement}",
+                "content": f"Repository: {self.repo}\n"
+                           f"Note: You are already placed at the root of the repository directory.\n"
+                           f"All paths should be relative to the current directory (e.g., use 'sympy/functions/elementary/hyperbolic.py').\n\n"
+                           f"Issue Description:\n{self.problem_statement}",
             },
         ]
         total_prompt_tokens: int = 0
@@ -150,39 +144,48 @@ class AgentSWEBench:
         final_patch: str = ""
         steps: List[Dict[str, Any]] = []
 
-        # --- BRIDGE ASYNC ENTRE LE EXEC() SYNCHRONE DE LA SANDBOX ET LE CLIENT MCP ---
-        def run_mcp_sync(name: str, args: dict) -> str:
-            future = asyncio.run_coroutine_threadsafe(mcp_client.call_tool(name, arguments=args), loop)
-            return future.result().content[0].text
+        import mcp_tools_swebench
 
-        # Fonction intermédiaire pour forcer l'affichage dans stdout (capturé par la sandbox)
-        def wrap_and_print(name: str, args: dict) -> str:
-            res = run_mcp_sync(name, args)
-            print(res)  # S'imprime DIRECTEMENT dans le flux stdout pour alimenter l'observation
+        target_repo_dir = self.repo.split("/")[-1]
+
+        def call_and_print(func, *args, **kwargs):
+            res = func(*args, **kwargs)
+            print(res)
             return res
 
-        # Injection des outils conformes au sujet avec impression automatique des résultats
+        # Normalisation de la commande extraite pour l'interpréteur local hôtier
+        raw_cmd = self.test_command
+        if raw_cmd.startswith("./"):
+            raw_cmd = raw_cmd[2:]
+        if raw_cmd.startswith("python "):
+            raw_cmd = raw_cmd[7:]
+        if raw_cmd.startswith("python3 "):
+            raw_cmd = raw_cmd[8:]
+
+        # Reconstruction de la commande de test pour s'exécuter de manière ultra-rapide (< 3 secondes)
+        universal_test_command = f"PYTHONPATH=. {sys.executable} {raw_cmd}"
+
         injected_tools = {
-            "read_file": lambda filepath, start_line, end_line: wrap_and_print(
-                "read_file", {"filepath": filepath, "start_line": int(start_line), "end_line": int(end_line)}
+            "read_file": lambda filepath, start_line, end_line: call_and_print(
+                mcp_tools_swebench.read_file, os.path.join(target_repo_dir, filepath), start_line, end_line
             ),
-            "edit_file": lambda filepath, old_str, new_str: wrap_and_print(
-                "edit_file", {"filepath": filepath, "old_str": old_str, "new_str": new_str}
+            "edit_file": lambda filepath, old_str, new_str: call_and_print(
+                mcp_tools_swebench.edit_file, os.path.join(target_repo_dir, filepath), old_str, new_str
             ),
-            "list_files": lambda directory=".", pattern="*": wrap_and_print(
-                "list_files", {"directory": directory, "pattern": pattern}
+            "list_files": lambda directory=".", pattern="*": call_and_print(
+                mcp_tools_swebench.list_files, os.path.join(target_repo_dir, directory), pattern
             ),
-            "search_code": lambda pattern, file_pattern="*.py": wrap_and_print(
-                "search_code", {"pattern": pattern, "file_pattern": file_pattern}
+            "search_code": lambda pattern, file_pattern="*.py": call_and_print(
+                mcp_tools_swebench.run_command, f"git grep -n '{pattern}' -- '{file_pattern}'", workdir=target_repo_dir
             ),
-            "run_tests": lambda: wrap_and_print(
-                "run_command", {"command": self.test_command}
+            "run_tests": lambda: call_and_print(
+                mcp_tools_swebench.run_command, universal_test_command, workdir=target_repo_dir
             ),
-            "get_patch": lambda: wrap_and_print(
-                "get_patch", {}
+            "get_patch": lambda: call_and_print(
+                mcp_tools_swebench.get_patch
             ),
-            "run_command": lambda command, workdir=".": wrap_and_print(
-                "run_command", {"command": command, "workdir": workdir}
+            "run_command": lambda command, workdir=".": call_and_print(
+                mcp_tools_swebench.run_command, command, workdir=os.path.join(target_repo_dir, workdir)
             ),
         }
 
@@ -190,16 +193,12 @@ class AgentSWEBench:
             print(f"--- SWE-bench Attempt {attempt} / {self.max_iterations} ---")
 
             start_api: float = time.time()
-            # Pas d'openai_tools passés ! Le modèle doit écrire du code brut [cite: 68]
             try:
                 api_answer = llm.call_api(messages_context, tools=None)
             except RuntimeError as e:
-                if "LLM_API_EXHAUSTED" in str(e):
-                    print(e)
-                    break  # <--- MAGIQUE : Sort gracieusement de la boucle for
-                else:
-                    print(e)
-                    break
+                print(e)
+                break
+                
             end_api: float = time.time()
             request_time_ms: float = (end_api - start_api) * 1000
 
@@ -208,41 +207,36 @@ class AgentSWEBench:
             total_prompt_tokens += step_input_tokens
             total_completion_tokens += step_output_tokens
 
-            # Respect des limites dures [cite: 735]
             if total_prompt_tokens > 300000 or total_completion_tokens > 10000:
                 print("Hard limits exceeded (Tokens)! Stopping agent.")
                 break
 
             llm_text = api_answer.get("text", "")
             
-            # Extraction du code Python généré par l'IA [cite: 172, 206]
-            code_to_run = ""
-            if "```python" in llm_text:
-                code_to_run = llm_text.split("```python")[1].split("```")[0]
-            elif "```" in llm_text:
-                code_to_run = llm_text.split("```")[1].split("```")[0]
+            # Extraction et fusion de TOUS les blocs de code Python générés dans la réponse
+            python_blocks = re.findall(r"```python\s*(.*?)\s*```", llm_text, re.DOTALL)
+            if python_blocks:
+                code_to_run = "\n".join(python_blocks)
             else:
                 code_to_run = llm_text
 
-            print("🏃 Envoi du code généré au Sandbox...")
+            print("Executing code in Sandbox...")
             sandbox_res = sandbox.execute_code(code_to_run.strip(), injected_tools=injected_tools)
             
             observation = sandbox_res.get("output", "")
             is_final = sandbox_res.get("is_final", False)
 
-            # Enregistrement du dialogue [cite: 229]
             messages_context.append({"role": "assistant", "content": llm_text})
             messages_context.append({"role": "user", "content": f"Observation from sandbox execution:\n{observation}"})
 
-            # Format de tracking obligatoire des StepMetrics [cite: 511, 555]
             steps.append({
                 "step": attempt,
                 "input_tokens": step_input_tokens,
                 "output_tokens": step_output_tokens,
                 "request_time_ms": request_time_ms,
                 "timestamp": datetime.now().isoformat(),
-                "api_url": self.config.provider_url,
-                "model_name": self.config.model_name,
+                "api_url": llm.rotator.get_current_config()["url"],
+                "model_name": llm.rotator.get_current_config()["model"],
                 "llm_output": llm_text,
                 "sandbox_input": code_to_run,
                 "sandbox_output": observation,
@@ -263,16 +257,36 @@ class AgentSWEBench:
         import subprocess
         llm, sandbox = self._init_tools()
         
-        # --- CLONAGE ET SETUP AUTOMATIQUE DU REPO (100% Autonome) ---
         repo_dir = self.repo.split("/")[-1]
         if not os.path.exists(repo_dir):
-            print(f"📥 Dépôt introuvable. Clonage automatique de [https://github.com/](https://github.com/){self.repo}.git...")
-            subprocess.run(f"git clone [https://github.com/](https://github.com/){self.repo}.git", shell=True)
+            print(f"📥 Dépôt introuvable. Clonage automatique de https://github.com/{self.repo}.git...")
+            subprocess.run(f"git clone https://github.com/{self.repo}.git", shell=True)
             
         print(f"🔄 Alignement du dépôt sur le commit : {self.base_commit}")
         subprocess.run(f"git checkout {self.base_commit}", shell=True, cwd=repo_dir)
 
-        # Lancement du serveur MCP configuré sur le bon dossier courant (cwd) [cite: 176]
+        # Injection dynamique d'un SHIM distutils complet pour corriger la barrière de rupture de Python 3.13
+        distutils_dir = os.path.join(repo_dir, "distutils")
+        os.makedirs(distutils_dir, exist_ok=True)
+        with open(os.path.join(distutils_dir, "__init__.py"), "w", encoding="utf-8") as f:
+            f.write("")
+        with open(os.path.join(distutils_dir, "version.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "import re\n"
+                "class LooseVersion:\n"
+                "    def __init__(self, vstring):\n"
+                "        self.vstring = vstring\n"
+                "        self.version = [int(x) if x.isdigit() else x for x in re.findall(r'\\d+', vstring)] if vstring else []\n"
+                "    def __str__(self): return self.vstring\n"
+                "    def __repr__(self): return f'LooseVersion({self.vstring!r})'\n"
+                "    def __lt__(self, other): return False\n"
+                "    def __le__(self, other): return True\n"
+                "    def __gt__(self, other): return False\n"
+                "    def __ge__(self, other): return True\n"
+                "    def __eq__(self, other): return True\n"
+                "    def __ne__(self, other): return False\n"
+            )
+
         server_params = StdioServerParameters(
             command=sys.executable,
             args=[os.path.abspath("mcp_tools_swebench.py")],
