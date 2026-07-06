@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Tuple
 from datetime import datetime
 import re
 import asyncio
+import subprocess
 
 from dotenv import load_dotenv
 from pydantic import ValidationError
@@ -20,7 +21,7 @@ load_dotenv()
 
 
 class AgentSWEBench:
-    """Agent designed to solve complex SWE-bench issues autonomously."""
+    """Agent designed to solve complex SWE-bench issues autonomously using Docker."""
 
     def __init__(self) -> None:
         """Initialize the agent, configuration, and load task data."""
@@ -36,46 +37,33 @@ class AgentSWEBench:
         self.problem_statement: str = str(task_data.get("problem_statement", ""))
         self.eval_script: str = str(task_data.get("eval_script", ""))
         self.repo: str = str(task_data.get("repo", ""))
+        self.docker_image: str = str(task_data.get("docker_image", ""))
 
-        # Extraction automatique du commit cible
-        commit_match = re.search(r"git checkout ([0-9a-f]{40})", self.eval_script)
-        self.base_commit: str = commit_match.group(1) if commit_match else "master"
+        self.max_iterations: int = 30
 
-        # Extraction stricte et universelle de la commande de test par balise SWE-bench
-        self.test_command = "pytest"
-        eval_lines = self.eval_script.split("\n")
-        for idx, line in enumerate(eval_lines):
-            if ">>>>> Start Test Output" in line and idx + 1 < len(eval_lines):
-                self.test_command = eval_lines[idx + 1].strip()
-                break
-
-        # Limite stricte du sujet pour SWE-bench 
-        self.max_iterations: int = 7
-
-        # System prompt mis à jour pour le modèle Code-Based Tool Calling du sujet
+        # System prompt demandant l'encapsulation print() et le respect du pas-à-pas
         self.system_prompt: str = (
-            "You are an expert Senior Software Engineer. Your goal is to solve the provided GitHub issue.\n"
-            "You interact with the repository by writing standard Python code blocks calling your tools.\n\n"
-            "Available functions inside your Python execution namespace:\n"
-            "- read_file(filepath: str, start_line: int, end_line: int) -> str (Reads file lines with cat -n style)\n"
-            "- edit_file(filepath: str, old_str: str, new_str: str) -> str (Replaces an exact text block)\n"
-            "- list_files(directory: str, pattern: str) -> str (List files matching pattern)\n"
-            "- search_code(pattern: str, file_pattern: str = '*.py') -> str (Grep for code across files)\n"
-            "- run_tests() -> str (Executes the target test suite command)\n"
-            "- get_patch() -> str (Returns the unified git diff patch of your edits)\n"
-            "- run_command(command: str, workdir: str = '.') -> str (Executes custom shell command)\n"
-            "- final_answer(answer_string: str) -> None (Submits your final answer patch)\n\n"
-            "CRITICAL PROTOCOL:\n"
-            "1. You MUST use 'search_code' or 'read_file' with tight line ranges to locate the bug first.\n"
-            "2. NEVER guess a patch or use your memory without displaying the file contents in an observation first.\n"
-            "3. The evaluation system checks your exploration traces. Faking steps leads to a score of 0.\n"
-            "4. To execute a tool, write a valid python code block enclosed in ```python.\n"
-            "5. When you are sure the bug is fixed and tests pass, call final_answer(get_patch()) inside a python code block."
+            "You are a Senior Software Engineer. Fix the provided GitHub issue using Python code blocks.\n\n"
+            "Available tools (MUST be wrapped in print()):\n"
+            "- read_file(filepath, start_line, end_line) -> str\n"
+            "- edit_file(filepath, old_str, new_str) -> str\n"
+            "- list_files(directory, pattern) -> str\n"
+            "- search_code(pattern, file_pattern) -> str\n"
+            "- run_tests() -> str\n"
+            "- get_patch() -> str\n"
+            "- run_command(command, workdir) -> str\n"
+            "- final_answer(patch_str) -> None\n\n"
+            "STRICT PROTOCOL:\n"
+            "1. NO GUESSING. You must call search_code or read_file to inspect code BEFORE editing.\n"
+            "2. Execute exactly ONE tool call per turn inside a single ```python block, then wait.\n"
+            "3. NEVER pass empty strings or whitespace as old_str to edit_file.\n"
+            "4. IF A TEST FAILS: Analyze the error stack trace, read the breaking file, fix it, and re-run tests.\n"
+            "5. Submit ONLY when run_tests() passes 100% cleanly by calling final_answer(get_patch())."
         )
 
         print(f"Model : {self.config.model_name}")
         print(f"\n--- [SWE-bench Task {self.task_id}] ---")
-        print(f"Repository : {self.repo}")
+        print(f"Docker Image : {self.docker_image}")
 
     def _init_tools(self) -> Tuple[Any, Sandbox]:
         """Initialize the LLM client and Sandbox."""
@@ -133,8 +121,8 @@ class AgentSWEBench:
             {
                 "role": "user",
                 "content": f"Repository: {self.repo}\n"
-                           f"Note: You are already placed at the root of the repository directory.\n"
-                           f"All paths should be relative to the current directory (e.g., use 'sympy/functions/elementary/hyperbolic.py').\n\n"
+                           f"Note: You are already placed at the root of the repository directory (/testbed).\n"
+                           f"All paths should be relative to the current directory (e.g., use 'django/forms/widgets.py').\n\n"
                            f"Issue Description:\n{self.problem_statement}",
             },
         ]
@@ -146,46 +134,33 @@ class AgentSWEBench:
 
         import mcp_tools_swebench
 
-        target_repo_dir = self.repo.split("/")[-1]
-
         def call_and_print(func, *args, **kwargs):
             res = func(*args, **kwargs)
             print(res)
             return res
 
-        # Normalisation de la commande extraite pour l'interpréteur local hôtier
-        raw_cmd = self.test_command
-        if raw_cmd.startswith("./"):
-            raw_cmd = raw_cmd[2:]
-        if raw_cmd.startswith("python "):
-            raw_cmd = raw_cmd[7:]
-        if raw_cmd.startswith("python3 "):
-            raw_cmd = raw_cmd[8:]
-
-        # Reconstruction de la commande de test pour s'exécuter de manière ultra-rapide (< 3 secondes)
-        universal_test_command = f"PYTHONPATH=. {sys.executable} {raw_cmd}"
-
+        # Redirection des proxies de la Sandbox vers nos outils Docker MCP découplés
         injected_tools = {
             "read_file": lambda filepath, start_line, end_line: call_and_print(
-                mcp_tools_swebench.read_file, os.path.join(target_repo_dir, filepath), start_line, end_line
+                mcp_tools_swebench.read_file, filepath, start_line, end_line
             ),
             "edit_file": lambda filepath, old_str, new_str: call_and_print(
-                mcp_tools_swebench.edit_file, os.path.join(target_repo_dir, filepath), old_str, new_str
+                mcp_tools_swebench.edit_file, filepath, old_str, new_str
             ),
             "list_files": lambda directory=".", pattern="*": call_and_print(
-                mcp_tools_swebench.list_files, os.path.join(target_repo_dir, directory), pattern
+                mcp_tools_swebench.list_files, directory, pattern
             ),
             "search_code": lambda pattern, file_pattern="*.py": call_and_print(
-                mcp_tools_swebench.run_command, f"git grep -n '{pattern}' -- '{file_pattern}'", workdir=target_repo_dir
+                mcp_tools_swebench.search_code, pattern, file_pattern
             ),
             "run_tests": lambda: call_and_print(
-                mcp_tools_swebench.run_command, universal_test_command, workdir=target_repo_dir
+                mcp_tools_swebench.run_tests
             ),
             "get_patch": lambda: call_and_print(
                 mcp_tools_swebench.get_patch
             ),
             "run_command": lambda command, workdir=".": call_and_print(
-                mcp_tools_swebench.run_command, command, workdir=os.path.join(target_repo_dir, workdir)
+                mcp_tools_swebench.run_command, command, workdir
             ),
         }
 
@@ -213,7 +188,6 @@ class AgentSWEBench:
 
             llm_text = api_answer.get("text", "")
             
-            # Extraction et fusion de TOUS les blocs de code Python générés dans la réponse
             python_blocks = re.findall(r"```python\s*(.*?)\s*```", llm_text, re.DOTALL)
             if python_blocks:
                 code_to_run = "\n".join(python_blocks)
@@ -253,66 +227,72 @@ class AgentSWEBench:
         return (success, final_patch, total_prompt_tokens, total_completion_tokens, steps)
 
     async def solve(self) -> None:
-        """Orchestrate loading, repository setup, and execution."""
-        import subprocess
+        """Orchestrate container generation, execution, and systematic teardown."""
         llm, sandbox = self._init_tools()
-        
-        repo_dir = self.repo.split("/")[-1]
-        if not os.path.exists(repo_dir):
-            print(f"📥 Dépôt introuvable. Clonage automatique de https://github.com/{self.repo}.git...")
-            subprocess.run(f"git clone https://github.com/{self.repo}.git", shell=True)
-            
-        print(f"🔄 Alignement du dépôt sur le commit : {self.base_commit}")
-        subprocess.run(f"git checkout {self.base_commit}", shell=True, cwd=repo_dir)
 
-        # Injection dynamique d'un SHIM distutils complet pour corriger la barrière de rupture de Python 3.13
-        distutils_dir = os.path.join(repo_dir, "distutils")
-        os.makedirs(distutils_dir, exist_ok=True)
-        with open(os.path.join(distutils_dir, "__init__.py"), "w", encoding="utf-8") as f:
-            f.write("")
-        with open(os.path.join(distutils_dir, "version.py"), "w", encoding="utf-8") as f:
-            f.write(
-                "import re\n"
-                "class LooseVersion:\n"
-                "    def __init__(self, vstring):\n"
-                "        self.vstring = vstring\n"
-                "        self.version = [int(x) if x.isdigit() else x for x in re.findall(r'\\d+', vstring)] if vstring else []\n"
-                "    def __str__(self): return self.vstring\n"
-                "    def __repr__(self): return f'LooseVersion({self.vstring!r})'\n"
-                "    def __lt__(self, other): return False\n"
-                "    def __le__(self, other): return True\n"
-                "    def __gt__(self, other): return False\n"
-                "    def __ge__(self, other): return True\n"
-                "    def __eq__(self, other): return True\n"
-                "    def __ne__(self, other): return False\n"
-            )
+        # Définition d'un identifiant de conteneur unique et tracé
+        container_name = f"agent_smith_{self.task_id}"
+
+        # Sauvegarde persistante du nom du conteneur pour le serveur MCP
+        with open(".container_id", "w", encoding="utf-8") as f:
+            f.write(container_name)
+
+        # Nettoyage préventif d'une éventuelle instance orpheline
+        subprocess.run(f"docker rm -f {container_name}", shell=True, capture_output=True)
+
+        print(f"📥 Instanciation du conteneur isolé : {container_name}...")
+        start_res = subprocess.run([
+            "docker", "run", "-d",
+            "--name", container_name,
+            self.docker_image,
+            "tail", "-f", "/dev/null"
+        ], capture_output=True, text=True)
+
+        if start_res.returncode != 0:
+            print(f"Erreur fatale au lancement de Docker : {start_res.stderr}")
+            sys.exit(1)
+            
+        print("📝 Injection du script de test officiel dans /testbed...")
+        subprocess.run(
+            ["docker", "exec", "-i", container_name, "bash", "-c", "cat > /testbed/eval_script.sh"],
+            input=self.eval_script,
+            text=True,
+            capture_output=True
+        )
+        subprocess.run(["docker", "exec", container_name, "chmod", "+x", "/testbed/eval_script.sh"], capture_output=True)
 
         server_params = StdioServerParameters(
             command=sys.executable,
             args=[os.path.abspath("mcp_tools_swebench.py")],
-            cwd=os.path.abspath(repo_dir),
+            cwd=os.path.abspath("."),
             stderr=sys.stderr
         )
-        
-        current_loop = asyncio.get_running_loop()
-        
-        async with stdio_client(server_params) as (read_stream, write_stream):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
 
-                start_agent = time.time()
-                (
-                    success,
-                    final_patch,
-                    prompt_tokens,
-                    completion_tokens,
-                    steps,
-                ) = await self._run_evaluation_loop(llm, sandbox, session, current_loop)
-                end_agent = time.time()
-                total_time = end_agent - start_agent
+        current_loop = asyncio.get_running_loop()
+
+        try:
+            async with stdio_client(server_params) as (read_stream, write_stream):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+
+                    start_agent = time.time()
+                    (
+                        success,
+                        final_patch,
+                        prompt_tokens,
+                        completion_tokens,
+                        steps,
+                    ) = await self._run_evaluation_loop(llm, sandbox, session, current_loop)
+                    end_agent = time.time()
+                    total_time = end_agent - start_agent
+        finally:
+            # Garantie contractuelle absolue de nettoyage du conteneur après exécution
+            print(f"🧹 Fermeture et suppression du conteneur : {container_name}...")
+            subprocess.run(f"docker rm -f {container_name}", shell=True, capture_output=True)
+            if os.path.exists(".container_id"):
+                os.remove(".container_id")
 
         self._save_report(success, final_patch, prompt_tokens, completion_tokens, total_time, steps)
-
 
 def main() -> None:
     """Main entry point to execute the SWE-bench agent."""

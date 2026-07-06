@@ -5,13 +5,11 @@ import multiprocessing
 import resource
 import socket
 import sys
+import time
 from typing import Any, Dict, Callable
 
 from student.sandbox_config import SandboxConfig
 from student.errors import ForbiddenNetworkError, UnauthorizedImportError, FinalAnswerException
-
-
-
 
 
 class Sandbox:
@@ -23,13 +21,11 @@ class Sandbox:
 
     def _apply_restrictions(self) -> None:
         """Internal method to activate security JUST BEFORE execution."""
-        # Convert Mo to bytes
         limit_ram: int = self.config.max_memory_mb * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_AS, (limit_ram, limit_ram))
 
         real_import = builtins.__import__
 
-        # Block unauthorized imports
         def secure_import(
             name: str,
             globals: Any = None,
@@ -47,11 +43,10 @@ class Sandbox:
                     f"Unauthorized import detected: {name}"
                 )
 
-            return real_import(name, globals, locals, fromlist, level)
+                return real_import(name, globals, locals, fromlist, level)
 
         builtins.__import__ = secure_import
 
-        # Disable network access
         def forbidden_socket(*args: Any, **kwargs: Any) -> Any:
             raise ForbiddenNetworkError(
                 "Network access is disabled inside this sandbox."
@@ -62,28 +57,40 @@ class Sandbox:
     def execute_code(self, code_str: str, injected_tools: Dict[str, Callable] | None = None) -> Dict[str, Any]:
         """
         Execute the AI code and return its output along with execution flags.
-        Supports injecting custom Python functions (like MCP tools and final_answer).
+        Uses an IPC proxy bridge to ensure all heavy tool actions happen 
+        strictly OUTSIDE the restricted sandbox process space.
         """
         queue: multiprocessing.Queue[Dict[str, Any]] = multiprocessing.Queue()
+        request_queue = multiprocessing.Queue()
+        response_queue = multiprocessing.Queue()
+        
         tools_to_inject = injected_tools or {}
 
-        def agent_routine() -> None:
+        # 1. Génération dynamique de proxies légers pour la Sandbox
+        proxy_tools = {}
+        for tool_name in tools_to_inject.keys():
+            def make_proxy(name):
+                def proxy_func(*args, **kwargs):
+                    # On déporte l'appel vers le processus parent sain
+                    request_queue.put((name, args, kwargs))
+                    return response_queue.get()
+                return proxy_func
+            proxy_tools[tool_name] = make_proxy(tool_name)
+
+        def agent_routine(tools_dict) -> None:
             self._apply_restrictions()
             get_print = io.StringIO()
             sys.stdout = get_print
             sys.stderr = get_print
             
-            # 1. Préparation de l'espace de nom (Namespace) d'exécution
             builtins_dict = sys.modules["builtins"].__dict__
             execution_globals = {"__builtins__": builtins_dict}
             
-            # 2. Injection dynamique des fonctions outils MCP transmises par l'agent
-            for tool_name, tool_func in tools_to_inject.items():
-                execution_globals[tool_name] = tool_func
+            # Injection des proxies légers à la place des vrais outils lourds
+            for tool_name, tool_proxy in tools_dict.items():
+                execution_globals[tool_name] = tool_proxy
                 
-            # 3. Injection native de la fonction obligatoire final_answer()
             def final_answer(answer_string: str) -> None:
-                # On lève une exception dédiée pour couper le exec() et transmettre la réponse
                 raise FinalAnswerException(str(answer_string))
                 
             execution_globals["final_answer"] = final_answer
@@ -97,7 +104,6 @@ class Sandbox:
                     "solution": ""
                 })
             except FinalAnswerException as fae:
-                # L'IA a appelé final_answer() avec succès !
                 queue.put({
                     "success": True, 
                     "is_final": True, 
@@ -105,37 +111,64 @@ class Sandbox:
                     "solution": fae.answer
                 })
             except BaseException as e:
-                # Gestion des interruptions systèmes requises par le sujet
                 if isinstance(e, (KeyboardInterrupt, SystemExit)):
                     raise e
                 queue.put({
                     "success": False,
                     "is_final": False,
-                    "output": (
-                        f"{get_print.getvalue()}"
-                        f"{type(e).__name__}: {e}"
-                    ),
+                    "output": f"{get_print.getvalue()}{type(e).__name__}: {e}",
                     "solution": ""
                 })
 
-        # Création et lancement du processus enfant
-        process = multiprocessing.Process(target=agent_routine)
+        # 2. Lancement de la Sandbox isolée
+        process = multiprocessing.Process(target=agent_routine, args=(proxy_tools,))
         process.start()
-        process.join(timeout=float(self.config.max_execution_time_seconds))
 
-        # Sécurité anti-boucle infinie
-        if process.is_alive():
-            process.terminate()
-            process.join()
-            return {
-                "success": False,
-                "is_final": False,
-                "output": "Timeout Error: Execution exceeded limit.",
-                "solution": ""
-            }
+        start_time = time.time()
+        timeout = float(self.config.max_execution_time_seconds)
+        final_result = None
+        
+        # 3. Boucle d'écoute active du Parent (Orchestrator)
+        while process.is_alive():
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                process.terminate()
+                process.join()
+                return {
+                    "success": False,
+                    "is_final": False,
+                    "output": "Timeout Error: Execution exceeded limit.",
+                    "solution": ""
+                }
+            
+            # Traitement des requêtes d'outils émises depuis l'intérieur de la sandbox
+            try:
+                from queue import Empty
+                req = request_queue.get(timeout=0.1)
+                t_name, t_args, t_kwargs = req
+                
+                # Exécution de l'outil réel dans l'espace non-restreint de l'hôte
+                if t_name in tools_to_inject:
+                    try:
+                        res = tools_to_inject[t_name](*t_args, **t_kwargs)
+                    except Exception as err:
+                        res = f"Error executing tool {t_name}: {str(err)}"
+                else:
+                    res = f"Error: Tool {t_name} not found."
+                    
+                # Renvoi du résultat propre au processus de la sandbox
+                response_queue.put(res)
+            except Empty:
+                continue
 
+        # Récupération du rapport d'exécution final
         if not queue.empty():
-            return queue.get()
+            final_result = queue.get()
+            
+        process.join()
+        
+        if final_result:
+            return final_result
             
         return {
             "success": False,

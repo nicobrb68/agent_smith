@@ -13,7 +13,7 @@ class TokenRotator:
 
     def _load_providers(self) -> None:
         """Détecte dynamiquement les providers configurés dans le .env."""
-        providers = ["GROQ", "OPENROUTER", "GEMINI"]
+        providers = ["GROQ", "OPENROUTER", "GEMINI", "OPENAI"]
         
         for p in providers:
             url = os.getenv(f"{p}_API_URL")
@@ -23,6 +23,9 @@ class TokenRotator:
             if url and model and keys_raw:
                 keys = [k.strip() for k in keys_raw.split(",") if k.strip()]
                 for key in keys:
+                    if p == "GEMINI" and model == "gemini-1.5-flash":
+                        model = "gemini-2.5-flash"
+                        
                     self.configs.append({
                         "url": url,
                         "model": model,
@@ -31,7 +34,7 @@ class TokenRotator:
                     
         if not self.configs:
             self.configs.append({
-                "url": "[https://api.groq.com/openai/v1](https://api.groq.com/openai/v1)",
+                "url": "https://api.groq.com/openai/v1",
                 "model": "llama-3.3-70b-versatile",
                 "key": "dummy"
             })
@@ -78,7 +81,14 @@ class LLMClient:
             client = OpenAI(base_url=base_url, api_key=config["key"])
             
             try:
-                kwargs = {"model": model_to_use, "messages": messages}
+                # payload strict optimisé pour le code sans hallucination créative
+                kwargs = {
+                    "model": model_to_use, 
+                    "messages": messages,
+                    "temperature": 0.0,
+                    "top_p": 0.95,
+                    "max_tokens": 4096
+                }
                 if tools:
                     kwargs["tools"] = tools
                     
