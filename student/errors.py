@@ -17,6 +17,7 @@ class ForbiddenNetworkError(SandboxError):
     """Levée lors d'une tentative d'accès réseau non autorisée."""
     pass
 
+
 class FinalAnswerException(SandboxError):
     """Exception interne pour intercepter l'appel à final_answer."""
     def __init__(self, answer: str):

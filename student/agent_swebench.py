@@ -3,14 +3,13 @@ from json import JSONDecodeError
 import os
 import sys
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Callable
 from datetime import datetime
 import re
 import asyncio
 import subprocess
 
 from dotenv import load_dotenv
-from pydantic import ValidationError
 from student.agent_config import AgentConfig
 from student.sandbox import Sandbox
 from student.sandbox_config import SandboxConfig
@@ -21,7 +20,7 @@ load_dotenv()
 
 
 class AgentSWEBench:
-    """Agent designed to solve complex SWE-bench issues autonomously using Docker."""
+    """Agent designed to solve complex SWE-bench issues autonomously."""
 
     def __init__(self) -> None:
         """Initialize the agent, configuration, and load task data."""
@@ -34,16 +33,18 @@ class AgentSWEBench:
             sys.exit(1)
 
         self.task_id: str = str(task_data.get("instance_id", ""))
-        self.problem_statement: str = str(task_data.get("problem_statement", ""))
+        self.problem_statement: str = str(
+            task_data.get("problem_statement", "")
+        )
         self.eval_script: str = str(task_data.get("eval_script", ""))
         self.repo: str = str(task_data.get("repo", ""))
         self.docker_image: str = str(task_data.get("docker_image", ""))
 
         self.max_iterations: int = 30
 
-        # System prompt demandant l'encapsulation print() et le respect du pas-à-pas
         self.system_prompt: str = (
-            "You are a Senior Software Engineer. Fix the provided GitHub issue using Python code blocks.\n\n"
+            "You are a Senior Software Engineer. Fix the provided GitHub "
+            "issue using Python code blocks.\n\n"
             "Available tools (MUST be wrapped in print()):\n"
             "- read_file(filepath, start_line, end_line) -> str\n"
             "- edit_file(filepath, old_str, new_str) -> str\n"
@@ -54,11 +55,16 @@ class AgentSWEBench:
             "- run_command(command, workdir) -> str\n"
             "- final_answer(patch_str) -> None\n\n"
             "STRICT PROTOCOL:\n"
-            "1. NO GUESSING. You must call search_code or read_file to inspect code BEFORE editing.\n"
-            "2. Execute exactly ONE tool call per turn inside a single ```python block, then wait.\n"
-            "3. NEVER pass empty strings or whitespace as old_str to edit_file.\n"
-            "4. IF A TEST FAILS: Analyze the error stack trace, read the breaking file, fix it, and re-run tests.\n"
-            "5. Submit ONLY when run_tests() passes 100% cleanly by calling final_answer(get_patch())."
+            "1. NO GUESSING. You must call search_code or read_file to "
+            "inspect code BEFORE editing.\n"
+            "2. Execute exactly ONE tool call per turn inside a single "
+            "```python block, then wait.\n"
+            "3. NEVER pass empty strings or whitespace as old_str to "
+            "edit_file.\n"
+            "4. IF A TEST FAILS: Analyze the error stack trace, read the "
+            "breaking file, fix it, and re-run tests.\n"
+            "5. Submit ONLY when run_tests() passes 100% cleanly by "
+            "calling final_answer(get_patch())."
         )
 
         print(f"Model : {self.config.model_name}")
@@ -70,11 +76,6 @@ class AgentSWEBench:
         from student.llm import LLMClient, TokenRotator
 
         rotator = TokenRotator()
-        # Kept fully deterministic on purpose: this agent explores
-        # the repository through MCP tool calls (read_file,
-        # search_code, run_tests, ...) rather than by regenerating
-        # a whole solution from scratch, so determinism helps it
-        # follow the strict tool-use protocol without drifting.
         llm = LLMClient(
             rotator,
             self.config.provider_url,
@@ -131,8 +132,10 @@ class AgentSWEBench:
             {
                 "role": "user",
                 "content": f"Repository: {self.repo}\n"
-                           f"Note: You are already placed at the root of the repository directory (/testbed).\n"
-                           f"All paths should be relative to the current directory (e.g., use 'django/forms/widgets.py').\n\n"
+                           f"Note: You are already placed at the root of "
+                           f"the repository directory (/testbed).\n"
+                           f"All paths should be relative to the current "
+                           f"directory (e.g., use 'widgets.py').\n\n"
                            f"Issue Description:\n{self.problem_statement}",
             },
         ]
@@ -144,15 +147,20 @@ class AgentSWEBench:
 
         import mcp_tools_swebench
 
-        def call_and_print(func, *args, **kwargs):
+        def call_and_print(func: Callable[..., Any],
+                           *args: Any, **kwargs: Any) -> Any:
             res = func(*args, **kwargs)
             print(res)
             return res
 
-        # Redirection des proxies de la Sandbox vers nos outils Docker MCP découplés
-        injected_tools = {
-            "read_file": lambda filepath, start_line, end_line: call_and_print(
-                mcp_tools_swebench.read_file, filepath, start_line, end_line
+        injected_tools: Dict[str, Callable[..., Any]] = {
+            "read_file": lambda filepath, start_line, end_line: (
+                call_and_print(
+                    mcp_tools_swebench.read_file,
+                    filepath,
+                    start_line,
+                    end_line,
+                )
             ),
             "edit_file": lambda filepath, old_str, new_str: call_and_print(
                 mcp_tools_swebench.edit_file, filepath, old_str, new_str
@@ -160,8 +168,10 @@ class AgentSWEBench:
             "list_files": lambda directory=".", pattern="*": call_and_print(
                 mcp_tools_swebench.list_files, directory, pattern
             ),
-            "search_code": lambda pattern, file_pattern="*.py": call_and_print(
-                mcp_tools_swebench.search_code, pattern, file_pattern
+            "search_code": lambda pattern, file_pattern="*.py": (
+                call_and_print(
+                    mcp_tools_swebench.search_code, pattern, file_pattern
+                )
             ),
             "run_tests": lambda: call_and_print(
                 mcp_tools_swebench.run_tests
@@ -175,7 +185,10 @@ class AgentSWEBench:
         }
 
         for attempt in range(1, self.max_iterations + 1):
-            print(f"--- SWE-bench Attempt {attempt} / {self.max_iterations} ---")
+            print(
+                f"--- SWE-bench Attempt {attempt} / "
+                f"{self.max_iterations} ---"
+            )
 
             start_api: float = time.time()
             try:
@@ -183,7 +196,7 @@ class AgentSWEBench:
             except RuntimeError as e:
                 print(e)
                 break
-                
+
             end_api: float = time.time()
             request_time_ms: float = (end_api - start_api) * 1000
 
@@ -192,26 +205,43 @@ class AgentSWEBench:
             total_prompt_tokens += step_input_tokens
             total_completion_tokens += step_output_tokens
 
-            if total_prompt_tokens > 300000 or total_completion_tokens > 10000:
+            if (
+                total_prompt_tokens > 300000
+                or total_completion_tokens > 10000
+            ):
                 print("Hard limits exceeded (Tokens)! Stopping agent.")
                 break
 
             llm_text = api_answer.get("text", "")
-            
-            python_blocks = re.findall(r"```python\s*(.*?)\s*```", llm_text, re.DOTALL)
+
+            python_blocks = re.findall(
+                r"```python\s*(.*?)\s*```", llm_text, re.DOTALL
+            )
             if python_blocks:
                 code_to_run = "\n".join(python_blocks)
             else:
                 code_to_run = llm_text
 
             print("Executing code in Sandbox...")
-            sandbox_res = sandbox.execute_code(code_to_run.strip(), injected_tools=injected_tools)
-            
+            sandbox_res = sandbox.execute_code(
+                code_to_run.strip(), injected_tools=injected_tools
+            )
+
             observation = sandbox_res.get("output", "")
             is_final = sandbox_res.get("is_final", False)
 
-            messages_context.append({"role": "assistant", "content": llm_text})
-            messages_context.append({"role": "user", "content": f"Observation from sandbox execution:\n{observation}"})
+            messages_context.append(
+                {"role": "assistant", "content": llm_text}
+            )
+            messages_context.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Observation from sandbox execution:\n"
+                        f"{observation}"
+                    ),
+                }
+            )
 
             steps.append({
                 "step": attempt,
@@ -231,27 +261,35 @@ class AgentSWEBench:
                 final_patch = sandbox_res.get("solution", "").strip()
                 success = "diff --git" in final_patch
                 if success:
-                    print("✅ L'IA a soumis un patch validé via final_answer() !")
+                    print(
+                        "✅ L'IA a soumis un patch validé via final_answer() !"
+                    )
                     break
 
-        return (success, final_patch, total_prompt_tokens, total_completion_tokens, steps)
+        return (
+            success,
+            final_patch,
+            total_prompt_tokens,
+            total_completion_tokens,
+            steps,
+        )
 
     async def solve(self) -> None:
-        """Orchestrate container generation, execution, and systematic teardown."""
+        """Orchestrate container generation and systematic teardown."""
         llm, sandbox = self._init_tools()
 
-        # Définition d'un identifiant de conteneur unique et tracé
         container_name = f"agent_smith_{self.task_id}"
 
-        # Sauvegarde persistante du nom du conteneur pour le serveur MCP
         try:
             with open(".container_id", "w", encoding="utf-8") as f:
                 f.write(container_name)
         except OSError as e:
             print(f"Error: {e}")
             sys.exit(1)
-        # Nettoyage préventif d'une éventuelle instance orpheline
-        subprocess.run(f"docker rm -f {container_name}", shell=True, capture_output=True)
+
+        subprocess.run(
+            f"docker rm -f {container_name}", shell=True, capture_output=True
+        )
 
         print(f"📥 Instanciation du conteneur isolé : {container_name}...")
         start_res = subprocess.run([
@@ -264,15 +302,24 @@ class AgentSWEBench:
         if start_res.returncode != 0:
             print(f"Erreur fatale au lancement de Docker : {start_res.stderr}")
             sys.exit(1)
-            
+
         print("📝 Injection du script de test officiel dans /testbed...")
         subprocess.run(
-            ["docker", "exec", "-i", container_name, "bash", "-c", "cat > /testbed/eval_script.sh"],
+            [
+                "docker", "exec", "-i", container_name,
+                "bash", "-c", "cat > /testbed/eval_script.sh"
+            ],
             input=self.eval_script,
             text=True,
             capture_output=True
         )
-        subprocess.run(["docker", "exec", container_name, "chmod", "+x", "/testbed/eval_script.sh"], capture_output=True)
+        subprocess.run(
+            [
+                "docker", "exec", container_name,
+                "chmod", "+x", "/testbed/eval_script.sh"
+            ],
+            capture_output=True
+        )
 
         server_params = StdioServerParameters(
             command=sys.executable,
@@ -284,8 +331,12 @@ class AgentSWEBench:
         current_loop = asyncio.get_running_loop()
 
         try:
-            async with stdio_client(server_params) as (read_stream, write_stream):
-                async with ClientSession(read_stream, write_stream) as session:
+            async with stdio_client(server_params) as (
+                read_stream, write_stream
+            ):
+                async with ClientSession(
+                    read_stream, write_stream
+                ) as session:
                     await session.initialize()
 
                     start_agent = time.time()
@@ -295,17 +346,33 @@ class AgentSWEBench:
                         prompt_tokens,
                         completion_tokens,
                         steps,
-                    ) = await self._run_evaluation_loop(llm, sandbox, session, current_loop)
+                    ) = await self._run_evaluation_loop(
+                        llm, sandbox, session, current_loop
+                    )
                     end_agent = time.time()
                     total_time = end_agent - start_agent
         finally:
-            # Garantie contractuelle absolue de nettoyage du conteneur après exécution
-            print(f"🧹 Fermeture et suppression du conteneur : {container_name}...")
-            subprocess.run(f"docker rm -f {container_name}", shell=True, capture_output=True)
+            print(
+                f"🧹 Fermeture et suppression du conteneur : "
+                f"{container_name}..."
+            )
+            subprocess.run(
+                f"docker rm -f {container_name}",
+                shell=True,
+                capture_output=True
+            )
             if os.path.exists(".container_id"):
                 os.remove(".container_id")
 
-        self._save_report(success, final_patch, prompt_tokens, completion_tokens, total_time, steps)
+        self._save_report(
+            success,
+            final_patch,
+            prompt_tokens,
+            completion_tokens,
+            total_time,
+            steps,
+        )
+
 
 def main() -> None:
     """Main entry point to execute the SWE-bench agent."""

@@ -10,7 +10,11 @@ from queue import Empty
 from typing import Any, Dict, Callable
 
 from student.sandbox_config import SandboxConfig
-from student.errors import ForbiddenNetworkError, UnauthorizedImportError, FinalAnswerException
+from student.errors import (
+    ForbiddenNetworkError,
+    UnauthorizedImportError,
+    FinalAnswerException,
+)
 
 
 class Sandbox:
@@ -43,7 +47,7 @@ class Sandbox:
                 raise UnauthorizedImportError(
                     f"Unauthorized import detected: {name}"
                 )
-            
+
             return real_import(name, globals, locals, fromlist, level)
 
         builtins.__import__ = secure_import
@@ -53,83 +57,84 @@ class Sandbox:
                 "Network access is disabled inside this sandbox."
             )
 
-        socket.socket = forbidden_socket
+        socket.socket = forbidden_socket  # type: ignore[misc, assignment]
 
-    def execute_code(self, code_str: str, injected_tools: Dict[str, Callable] | None = None) -> Dict[str, Any]:
-        """
-        Execute the AI code and return its output along with execution flags.
+    def execute_code(
+        self,
+        code_str: str,
+        injected_tools: Dict[str, Callable] | None = None,
+    ) -> Dict[str, Any]:
+        """Execute the AI code and return its output along with execution flags
         """
         queue: multiprocessing.Queue[Dict[str, Any]] = multiprocessing.Queue()
-        request_queue = multiprocessing.Queue()
-        response_queue = multiprocessing.Queue()
-        
+        request_queue: multiprocessing.Queue[Any] = multiprocessing.Queue()
+        response_queue: multiprocessing.Queue[Any] = multiprocessing.Queue()
+
         tools_to_inject = injected_tools or {}
 
-        # 1. Génération dynamique de proxies légers
         proxy_tools = {}
         for tool_name in tools_to_inject.keys():
-            def make_proxy(name):
-                def proxy_func(*args, **kwargs):
+            def make_proxy(name: str) -> Callable[..., Any]:
+                def proxy_func(*args: Any, **kwargs: Any) -> Any:
                     request_queue.put((name, args, kwargs))
                     return response_queue.get()
                 return proxy_func
             proxy_tools[tool_name] = make_proxy(tool_name)
 
-        def agent_routine(tools_dict) -> None:
-            # Capturer TOUT le flux d'impression dès le départ
+        def agent_routine(tools_dict: Dict[str, Callable[..., Any]]) -> None:
             get_print = io.StringIO()
             sys.stdout = get_print
             sys.stderr = get_print
-            
+
             try:
-                # Placer les restrictions à l'intérieur du try pour intercepter les MemoryErrors d'initialisation
                 self._apply_restrictions()
-                
+
                 builtins_dict = sys.modules["builtins"].__dict__
-                execution_globals = {"__builtins__": builtins_dict}
-                
+                execution_globals: Dict[str, Any] = (
+                    {"__builtins__": builtins_dict})
+
                 for tool_name, tool_proxy in tools_dict.items():
                     execution_globals[tool_name] = tool_proxy
-                    
+
                 def final_answer(answer_string: str) -> None:
                     raise FinalAnswerException(str(answer_string))
-                    
+
                 execution_globals["final_answer"] = final_answer
 
                 exec(code_str, execution_globals)
                 queue.put({
-                    "success": True, 
-                    "is_final": False, 
+                    "success": True,
+                    "is_final": False,
                     "output": get_print.getvalue(),
-                    "solution": ""
+                    "solution": "",
                 })
             except FinalAnswerException as fae:
                 queue.put({
-                    "success": True, 
-                    "is_final": True, 
+                    "success": True,
+                    "is_final": True,
                     "output": get_print.getvalue(),
-                    "solution": fae.answer
+                    "solution": fae.answer,
                 })
             except BaseException as e:
                 if isinstance(e, (KeyboardInterrupt, SystemExit)):
                     raise e
-                # Remonter l'erreur système exacte (ex: MemoryError) au parent
                 queue.put({
                     "success": False,
                     "is_final": False,
-                    "output": f"{get_print.getvalue()}\n{type(e).__name__}: {e}",
-                    "solution": ""
+                    "output": f"{get_print.getvalue()}\n"
+                    f"{type(e).__name__}: {e}",
+                    "solution": "",
                 })
 
-        # 2. Lancement de la Sandbox isolée
-        process = multiprocessing.Process(target=agent_routine, args=(proxy_tools,))
+        process = multiprocessing.Process(
+            target=agent_routine, args=(proxy_tools,)
+        )
         process.start()
 
         start_time = time.time()
         timeout = float(self.config.max_execution_time_seconds)
         final_result = None
-        
-        # 3. Boucle d'écoute active du Parent (Orchestrator)
+
         while process.is_alive():
             elapsed = time.time() - start_time
             if elapsed > timeout:
@@ -139,13 +144,13 @@ class Sandbox:
                     "success": False,
                     "is_final": False,
                     "output": "Timeout Error: Execution exceeded limit.",
-                    "solution": ""
+                    "solution": "",
                 }
-            
+
             try:
                 req = request_queue.get(timeout=0.1)
                 t_name, t_args, t_kwargs = req
-                
+
                 if t_name in tools_to_inject:
                     try:
                         res = tools_to_inject[t_name](*t_args, **t_kwargs)
@@ -153,25 +158,27 @@ class Sandbox:
                         res = f"Error executing tool {t_name}: {str(err)}"
                 else:
                     res = f"Error: Tool {t_name} not found."
-                    
+
                 response_queue.put(res)
             except Empty:
                 continue
 
-        # 4. Lecture sécurisée des données de la Queue avec timeout explicite (sans passer par .empty())
         try:
             final_result = queue.get(timeout=1.0)
         except Empty:
             final_result = None
-            
+
         process.join()
-        
+
         if final_result:
             return final_result
-            
+
         return {
             "success": False,
             "is_final": False,
-            "output": "Fatal Sandbox Error: Child process terminated without returning metrics.",
-            "solution": ""
+            "output": (
+                "Fatal Sandbox Error: Child process terminated without "
+                "returning metrics."
+            ),
+            "solution": "",
         }

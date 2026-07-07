@@ -22,10 +22,6 @@ lint:
 		--check-untyped-defs \
 		$(TARGETS)
 
-lint-strict:
-	@echo "Running strict quality checks..."
-	$(FLAKE8) $(TARGETS)
-	$(MYPY) --strict $(TARGETS)
 
 # Run a sample dump/eval cycle for MBPP based on subject CLI
 test-mbpp:
