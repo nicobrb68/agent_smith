@@ -6,6 +6,7 @@ import resource
 import socket
 import sys
 import time
+from queue import Empty
 from typing import Any, Dict, Callable
 
 from student.sandbox_config import SandboxConfig
@@ -42,8 +43,8 @@ class Sandbox:
                 raise UnauthorizedImportError(
                     f"Unauthorized import detected: {name}"
                 )
-
-                return real_import(name, globals, locals, fromlist, level)
+            
+            return real_import(name, globals, locals, fromlist, level)
 
         builtins.__import__ = secure_import
 
@@ -57,8 +58,6 @@ class Sandbox:
     def execute_code(self, code_str: str, injected_tools: Dict[str, Callable] | None = None) -> Dict[str, Any]:
         """
         Execute the AI code and return its output along with execution flags.
-        Uses an IPC proxy bridge to ensure all heavy tool actions happen 
-        strictly OUTSIDE the restricted sandbox process space.
         """
         queue: multiprocessing.Queue[Dict[str, Any]] = multiprocessing.Queue()
         request_queue = multiprocessing.Queue()
@@ -66,36 +65,37 @@ class Sandbox:
         
         tools_to_inject = injected_tools or {}
 
-        # 1. Génération dynamique de proxies légers pour la Sandbox
+        # 1. Génération dynamique de proxies légers
         proxy_tools = {}
         for tool_name in tools_to_inject.keys():
             def make_proxy(name):
                 def proxy_func(*args, **kwargs):
-                    # On déporte l'appel vers le processus parent sain
                     request_queue.put((name, args, kwargs))
                     return response_queue.get()
                 return proxy_func
             proxy_tools[tool_name] = make_proxy(tool_name)
 
         def agent_routine(tools_dict) -> None:
-            self._apply_restrictions()
+            # Capturer TOUT le flux d'impression dès le départ
             get_print = io.StringIO()
             sys.stdout = get_print
             sys.stderr = get_print
             
-            builtins_dict = sys.modules["builtins"].__dict__
-            execution_globals = {"__builtins__": builtins_dict}
-            
-            # Injection des proxies légers à la place des vrais outils lourds
-            for tool_name, tool_proxy in tools_dict.items():
-                execution_globals[tool_name] = tool_proxy
-                
-            def final_answer(answer_string: str) -> None:
-                raise FinalAnswerException(str(answer_string))
-                
-            execution_globals["final_answer"] = final_answer
-
             try:
+                # Placer les restrictions à l'intérieur du try pour intercepter les MemoryErrors d'initialisation
+                self._apply_restrictions()
+                
+                builtins_dict = sys.modules["builtins"].__dict__
+                execution_globals = {"__builtins__": builtins_dict}
+                
+                for tool_name, tool_proxy in tools_dict.items():
+                    execution_globals[tool_name] = tool_proxy
+                    
+                def final_answer(answer_string: str) -> None:
+                    raise FinalAnswerException(str(answer_string))
+                    
+                execution_globals["final_answer"] = final_answer
+
                 exec(code_str, execution_globals)
                 queue.put({
                     "success": True, 
@@ -113,10 +113,11 @@ class Sandbox:
             except BaseException as e:
                 if isinstance(e, (KeyboardInterrupt, SystemExit)):
                     raise e
+                # Remonter l'erreur système exacte (ex: MemoryError) au parent
                 queue.put({
                     "success": False,
                     "is_final": False,
-                    "output": f"{get_print.getvalue()}{type(e).__name__}: {e}",
+                    "output": f"{get_print.getvalue()}\n{type(e).__name__}: {e}",
                     "solution": ""
                 })
 
@@ -141,13 +142,10 @@ class Sandbox:
                     "solution": ""
                 }
             
-            # Traitement des requêtes d'outils émises depuis l'intérieur de la sandbox
             try:
-                from queue import Empty
                 req = request_queue.get(timeout=0.1)
                 t_name, t_args, t_kwargs = req
                 
-                # Exécution de l'outil réel dans l'espace non-restreint de l'hôte
                 if t_name in tools_to_inject:
                     try:
                         res = tools_to_inject[t_name](*t_args, **t_kwargs)
@@ -156,14 +154,15 @@ class Sandbox:
                 else:
                     res = f"Error: Tool {t_name} not found."
                     
-                # Renvoi du résultat propre au processus de la sandbox
                 response_queue.put(res)
             except Empty:
                 continue
 
-        # Récupération du rapport d'exécution final
-        if not queue.empty():
-            final_result = queue.get()
+        # 4. Lecture sécurisée des données de la Queue avec timeout explicite (sans passer par .empty())
+        try:
+            final_result = queue.get(timeout=1.0)
+        except Empty:
+            final_result = None
             
         process.join()
         
@@ -173,6 +172,6 @@ class Sandbox:
         return {
             "success": False,
             "is_final": False,
-            "output": "Unknown Error: No output recorded",
+            "output": "Fatal Sandbox Error: Child process terminated without returning metrics.",
             "solution": ""
         }

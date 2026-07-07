@@ -7,10 +7,12 @@ mcp = FastMCP("SWE-Bench Tools Server")
 
 def get_container() -> str:
     """Récupère le nom du conteneur cible persistant."""
-    if os.path.exists(".container_id"):
-        with open(".container_id", "r", encoding="utf-8") as f:
-            return f.read().strip()
-    return "swe_sandbox"
+    try:
+        if os.path.exists(".container_id"):
+            with open(".container_id", "r", encoding="utf-8") as f:
+                return f.read().strip()
+    except OSError:
+        return "swe_sandbox"
 
 def normalize_container_path(path: str) -> str:
     """Normalise les chemins fournis par l'IA pour correspondre au dossier /testbed."""

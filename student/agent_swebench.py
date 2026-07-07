@@ -70,8 +70,18 @@ class AgentSWEBench:
         from student.llm import LLMClient, TokenRotator
 
         rotator = TokenRotator()
-        llm = LLMClient(rotator, self.config.provider_url, self.config.model_name)
-        
+        # Kept fully deterministic on purpose: this agent explores
+        # the repository through MCP tool calls (read_file,
+        # search_code, run_tests, ...) rather than by regenerating
+        # a whole solution from scratch, so determinism helps it
+        # follow the strict tool-use protocol without drifting.
+        llm = LLMClient(
+            rotator,
+            self.config.provider_url,
+            self.config.model_name,
+            temperature=0.0,
+        )
+
         sandbox_config = SandboxConfig()
         sandbox: Sandbox = Sandbox(sandbox_config)
 
@@ -234,9 +244,12 @@ class AgentSWEBench:
         container_name = f"agent_smith_{self.task_id}"
 
         # Sauvegarde persistante du nom du conteneur pour le serveur MCP
-        with open(".container_id", "w", encoding="utf-8") as f:
-            f.write(container_name)
-
+        try:
+            with open(".container_id", "w", encoding="utf-8") as f:
+                f.write(container_name)
+        except OSError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
         # Nettoyage préventif d'une éventuelle instance orpheline
         subprocess.run(f"docker rm -f {container_name}", shell=True, capture_output=True)
 
