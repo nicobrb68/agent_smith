@@ -48,9 +48,9 @@ clean:
 
 dump-swebench:
 	@echo "Generating swebench_task.json..."
-	cd moulinette && uv run moulinette_eval dump swebench --output cache/swebench_task.json
+	cd moulinette && uv run moulinette_eval dump swebench --output ../cache/swebench_task.json
 
 dump-mbpp:
 	@echo "Generating mbpp_task.json..."
-	cd moulinette && uv run moulinette_eval dump mbpp --output cache/mbpp_task.json
+	cd moulinette && uv run moulinette_eval dump mbpp --output ../cache/mbpp_task.json
 	

@@ -3,8 +3,9 @@ from typing import List
 
 
 class SandboxConfig(BaseModel):
-    """Configuration de la sandbox pour les solutions étudiantes.
-    Approche par allowlist : seuls les modules autorisés peuvent être importés.
+    """Sandbox configuration for student solutions.
+    Uses allowlist approach: only imports in authorized_imports are allowed.
+    Everything else is blocked by default.
     """
     authorized_imports: List[str] = Field(default_factory=lambda: [
         "math", "math.*",

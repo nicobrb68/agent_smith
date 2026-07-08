@@ -1,23 +1,68 @@
+"""MCP tools for the SWE-bench agent.
+
+Exposes filesystem, code-search, and execution tools that operate
+inside a persistent Docker container (see get_container()) through
+``docker exec``. These are plain, format-agnostic MCP tools that
+the sandboxed agent code calls as regular Python functions.
+"""
 import os
+import re
 import subprocess
+from typing import List
+
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("SWE-Bench Tools Server")
 
+DEFAULT_CONTAINER_NAME: str = "swe_sandbox"
+MAX_LOG_LINES: int = 150
+HEADER_LINES: int = 20
+FOOTER_LINES: int = 100
+
+# Lines that carry an actual test verdict (pass/fail counts,
+# tracebacks, assertion errors, the SWE-bench harness markers, ...)
+# are always preserved when a log gets truncated, regardless of
+# where they land, so truncation can never hide whether the tests
+# actually passed.
+_RESULT_LINE_RE = re.compile(
+    r"(\bpassed\b|\bfailed\b|\berror\b|\bok\b|"
+    r">>>>> (?:start|end) test output|"
+    r"^ran \d+ tests?|"
+    r"traceback \(most recent call last\)|"
+    r"assertionerror)",
+    re.IGNORECASE,
+)
+
 
 def get_container() -> str:
-    """get the name of the container"""
+    """Return the name of the persistent target container.
+
+    Returns:
+        str: The container name stored in ``.container_id``, or
+        the default sandbox name if that file is missing, empty,
+        or unreadable.
+    """
     try:
         if os.path.exists(".container_id"):
             with open(".container_id", "r", encoding="utf-8") as f:
-                return f.read().strip()
+                name = f.read().strip()
+                if name:
+                    return name
     except OSError:
         pass
-    return "swe_sandbox"
+    return DEFAULT_CONTAINER_NAME
 
 
 def normalize_container_path(path: str) -> str:
-    """Normalize path /testbed."""
+    """Normalize an agent-provided path to live under /testbed.
+
+    Args:
+        path: A path as given by the agent, absolute or relative.
+
+    Returns:
+        str: The path rewritten so it is guaranteed to live under
+        ``/testbed`` inside the container.
+    """
     if path.startswith("/testbed"):
         return path
     return os.path.join("/testbed", path.lstrip("/"))
@@ -25,7 +70,18 @@ def normalize_container_path(path: str) -> str:
 
 @mcp.tool()
 def read_file(filepath: str, start_line: int, end_line: int) -> str:
-    """Read file content with line numbers inside the container."""
+    """Read a slice of a container file with line numbers.
+
+    Args:
+        filepath: Path to the file, relative to /testbed or
+            absolute.
+        start_line: First line to read (1-indexed, inclusive).
+        end_line: Last line to read (1-indexed, inclusive).
+
+    Returns:
+        str: The requested lines formatted like ``cat -n``, or an
+        error message on failure.
+    """
     container = get_container()
     target_path = normalize_container_path(filepath)
 
@@ -52,7 +108,19 @@ except Exception as e:
 
 @mcp.tool()
 def edit_file(filepath: str, old_str: str, new_str: str) -> str:
-    """Replace an exact string in a container file with a new string."""
+    """Replace an exact string in a container file.
+
+    Args:
+        filepath: Path to the file, relative to /testbed or
+            absolute.
+        old_str: The exact substring to replace. Must be
+            non-empty and non-whitespace-only.
+        new_str: The replacement string.
+
+    Returns:
+        str: A success message, or an error message on failure
+        (file not found, ``old_str`` not present, ...).
+    """
     if not old_str or not old_str.strip():
         return (
             "Error: 'old_str' cannot be empty or whitespace. "
@@ -68,7 +136,10 @@ try:
     with open({repr(target_path)}, 'r', encoding='utf-8') as f:
         content = f.read()
     if {repr(old_str)} not in content:
-        print("Error: Could not find exact 'old_str' in file", file=sys.stderr)
+        print(
+            "Error: Could not find the exact 'old_str' in file.",
+            file=sys.stderr,
+        )
         sys.exit(1)
     new_content = content.replace({repr(old_str)}, {repr(new_str)})
     with open({repr(target_path)}, 'w', encoding='utf-8') as f:
@@ -89,7 +160,17 @@ except Exception as e:
 
 @mcp.tool()
 def list_files(directory: str = ".", pattern: str = "*") -> str:
-    """List container files matching a given pattern."""
+    """List container files matching a glob pattern.
+
+    Args:
+        directory: Directory to search, relative to /testbed or
+            absolute.
+        pattern: A ``fnmatch``-style glob pattern (e.g. ``*.py``).
+
+    Returns:
+        str: One matching path per line, or a "no files found"
+        message.
+    """
     container = get_container()
     target_dir = normalize_container_path(directory)
 
@@ -113,11 +194,25 @@ for root, dirs, files in os.walk({repr(target_dir)}):
     )
 
 
-# === V.5.2 CODE SEARCH TOOLS ===
-
 @mcp.tool()
 def search_code(pattern: str, file_pattern: str = "*.py") -> str:
-    """Perform a grep-like search inside the container codebase."""
+    """Search the codebase for a literal substring (grep -F style).
+
+    NOTE: ``pattern`` is matched as a plain, case-sensitive
+    substring, NOT as a regular expression. Characters such as
+    ``( ) . * + ?`` are matched literally and must NOT be escaped
+    (e.g. search for ``area_polygon(s, l)`` as-is, not
+    ``area_polygon\\(s, l\\)``).
+
+    Args:
+        pattern: The literal substring to search for.
+        file_pattern: A ``fnmatch``-style glob restricting which
+            files are searched (e.g. ``*.py``).
+
+    Returns:
+        str: One ``path:line: content`` entry per match, or a
+        "no matches found" message.
+    """
     container = get_container()
 
     code = """
@@ -133,27 +228,22 @@ for root, dirs, files in os.walk('/testbed'):
         full_path = os.path.join(root, file)
         rel_path = os.path.relpath(full_path, '/testbed')
 
-        match_f = fnmatch.fnmatch(file, file_pattern)
-        match_r = fnmatch.fnmatch(rel_path, file_pattern)
-        if match_f or match_r:
+        matches_file = fnmatch.fnmatch(file, file_pattern)
+        matches_rel = fnmatch.fnmatch(rel_path, file_pattern)
+        if matches_file or matches_rel:
             try:
                 with open(full_path, 'r', encoding='utf-8') as f:
                     for num, line in enumerate(f, 1):
                         if pattern in line:
-                            print(f"{rel_path}:{num}: {line.strip()}")
-            except:
+                            loc = f"{rel_path}:{num}"
+                            print(f"{loc}: {line.strip()}")
+            except Exception:
                 continue
 """
     res = subprocess.run(
         [
-            "docker",
-            "exec",
-            "-i",
-            container,
-            "python3",
-            "-",
-            file_pattern,
-            pattern,
+            "docker", "exec", "-i", container, "python3", "-",
+            file_pattern, pattern,
         ],
         input=code,
         text=True,
@@ -162,60 +252,104 @@ for root, dirs, files in os.walk('/testbed'):
     return res.stdout if res.stdout.strip() else "No matches found."
 
 
-# === V.5.3 EXECUTION TOOLS ===
+def _preserve_result_lines(
+    cleaned_lines: List[str], header: List[str], footer: List[str]
+) -> List[str]:
+    """Collect verdict lines dropped by header/footer truncation.
+
+    Args:
+        cleaned_lines: The full log, one entry per line.
+        header: The lines already kept at the start of the log.
+        footer: The lines already kept at the end of the log.
+
+    Returns:
+        List[str]: Formatted ``L<index>: <line>`` entries for
+        every line matching ``_RESULT_LINE_RE`` that falls outside
+        the kept header/footer window.
+    """
+    kept_start = len(header)
+    kept_end = len(cleaned_lines) - len(footer)
+
+    preserved: List[str] = []
+    for index, line in enumerate(cleaned_lines):
+        in_kept_window = kept_start <= index < kept_end
+        if in_kept_window and _RESULT_LINE_RE.search(line):
+            preserved.append(f"  L{index}: {line}")
+    return preserved
+
 
 @mcp.tool()
 def run_tests() -> str:
-    """Execute the evaluation script directly inside the container."""
+    """Execute the evaluation script inside the container.
+
+    Returns:
+        str: The evaluation script's stdout/stderr. Long logs are
+        truncated to a header and a footer to save tokens, but any
+        line that looks like an actual test verdict (pass/fail
+        counts, tracebacks, assertion errors, the SWE-bench harness
+        markers, ...) is always preserved regardless of where it
+        falls in the log, so truncation can never hide whether the
+        tests actually passed.
+    """
     container = get_container()
     try:
         res = subprocess.run(
-            ["docker", "exec", container, "bash", "/testbed/eval_script.sh"],
+            [
+                "docker", "exec", container, "bash",
+                "/testbed/eval_script.sh",
+            ],
             capture_output=True,
             text=True,
             timeout=300,
         )
-
-        output = f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
-        lines = output.split("\n")
-
-        cleaned_lines = [
-            line_str
-            for line_str in lines
-            if not line_str.strip().startswith("++")
-        ]
-
-        if len(cleaned_lines) > 150:
-            header = cleaned_lines[:20]
-            footer = cleaned_lines[-100:]
-            truncated_output = (
-                header
-                + ["\n... [TRUNCATED LOGS: TOKENS SAVED] ...\n"]
-                + footer
-            )
-            return "\n".join(truncated_output)
-
-        return "\n".join(cleaned_lines)
-
     except subprocess.TimeoutExpired:
         return "Error: Test execution timed out after 300 seconds."
+
+    output = f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
+    lines = output.split("\n")
+
+    # Drop conda/bash "set -x" activation noise (lines starting
+    # with "++"): pure clutter, never carries a verdict.
+    cleaned_lines = [
+        line for line in lines if not line.strip().startswith("++")
+    ]
+
+    if len(cleaned_lines) <= MAX_LOG_LINES:
+        return "\n".join(cleaned_lines)
+
+    header = cleaned_lines[:HEADER_LINES]
+    footer = cleaned_lines[-FOOTER_LINES:]
+    preserved = _preserve_result_lines(cleaned_lines, header, footer)
+
+    truncated_output: List[str] = list(header)
+    truncated_output.append("")
+    truncated_output.append("... [TRUNCATED LOGS: TOKENS SAVED] ...")
+    if preserved:
+        truncated_output.append("")
+        truncated_output.append(
+            "PRESERVED TEST RESULT LINES (kept despite "
+            "truncation, line numbers refer to the original log):"
+        )
+        truncated_output.extend(preserved)
+    truncated_output.append("")
+    truncated_output.extend(footer)
+
+    return "\n".join(truncated_output)
 
 
 @mcp.tool()
 def get_patch() -> str:
-    """Retrieve the unified git diff of all changes made to the repo."""
+    """Retrieve the unified git diff of repository changes.
+
+    Returns:
+        str: The output of ``git diff`` for the container's
+        repository, or a message indicating no changes were made.
+    """
     container = get_container()
     res = subprocess.run(
         [
-            "docker",
-            "exec",
-            "-w",
-            "/testbed",
-            container,
-            "git",
-            "-c",
-            "core.fileMode=false",
-            "diff",
+            "docker", "exec", "-w", "/testbed", container, "git",
+            "-c", "core.fileMode=false", "diff",
         ],
         capture_output=True,
         text=True,
@@ -229,7 +363,16 @@ def get_patch() -> str:
 
 @mcp.tool()
 def run_command(command: str, workdir: str = ".") -> str:
-    """Execute a shell command in the specified working directory."""
+    """Execute a shell command inside the container.
+
+    Args:
+        command: The shell command to run.
+        workdir: Working directory, relative to /testbed or
+            absolute.
+
+    Returns:
+        str: The command's exit code, stdout, and stderr.
+    """
     container = get_container()
     target_dir = (
         workdir
@@ -238,23 +381,14 @@ def run_command(command: str, workdir: str = ".") -> str:
     )
 
     res = subprocess.run(
-        [
-            "docker",
-            "exec",
-            "-w",
-            target_dir,
-            container,
-            "bash",
-            "-c",
-            command,
-        ],
+        ["docker", "exec", "-w", target_dir, container, "bash",
+         "-c", command],
         capture_output=True,
         text=True,
     )
     return (
         f"EXIT CODE: {res.returncode}\n"
-        f"STDOUT:\n{res.stdout}\n"
-        f"STDERR:\n{res.stderr}"
+        f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
     )
 
 
