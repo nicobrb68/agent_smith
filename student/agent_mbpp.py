@@ -32,7 +32,7 @@ MAX_COMPLETION_TOKENS: int = 1500
 # moderate temperature lets it actually diversify between attempts.
 # (SWE-bench keeps 0.0: it relies on tool calls to explore the
 # repository, where determinism matters more than diversity.)
-MBPP_TEMPERATURE: float = 0.7
+MBPP_TEMPERATURE: float = 3
 
 
 class AgentMbpp:
@@ -93,6 +93,7 @@ class AgentMbpp:
             "```python\n"
             "def average(nums):\n"
             "    return sum(nums) / len(nums)\n"
+            " DO NOT try to do twice the exact same thing if the first attempt failed"
             "```"
         )
 
@@ -309,9 +310,14 @@ class AgentMbpp:
             print(f"--- Attempt {attempt} / {MAX_ATTEMPTS} ---")
 
             start_api: float = time.time()
-            api_answer: Dict[str, Any] = llm.call_api(
-                messages_context
-            )
+            try:
+                api_answer: Dict[str, Any] = llm.call_api(
+                    messages_context
+                )
+            except RuntimeError as e:
+                print(f"Error: {e}")
+                sys.exit(1)
+
             end_api: float = time.time()
             request_time_ms: float = (end_api - start_api) * 1000
 
