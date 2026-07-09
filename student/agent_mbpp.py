@@ -194,8 +194,8 @@ class AgentMbpp:
             lines.append("    __all_tests_passed = False")
             lines.append("except Exception as e:")
             lines.append(
-                "    print(f'Runtime Error during test: "
-                "{type(e).__name__}: {e}')"
+                f"    print(f'Runtime Error during [ {test_assert} ]: "
+                "{{type(e).__name__}}: {{e}}')"
             )
             lines.append("    __all_tests_passed = False")
 
