@@ -11,7 +11,7 @@ import sys
 import time
 from datetime import datetime
 from json import JSONDecodeError
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from pydantic import ValidationError
@@ -32,7 +32,15 @@ MAX_COMPLETION_TOKENS: int = 1500
 # moderate temperature lets it actually diversify between attempts.
 # (SWE-bench keeps 0.0: it relies on tool calls to explore the
 # repository, where determinism matters more than diversity.)
-MBPP_TEMPERATURE: float = 3
+MBPP_TEMPERATURE: float = 0.7
+
+# When the model regenerates the exact same (failing) code as its
+# previous attempt, nudging the temperature up for the next call
+# forces it out of that local minimum instead of retrying the same
+# thing forever. The bump grows with consecutive repeats and is
+# capped so it never turns into pure noise.
+REPEAT_TEMPERATURE_STEP: float = 0.2
+REPEAT_TEMPERATURE_MAX: float = 1.3
 
 
 class AgentMbpp:
@@ -93,7 +101,6 @@ class AgentMbpp:
             "```python\n"
             "def average(nums):\n"
             "    return sum(nums) / len(nums)\n"
-            " DO NOT try to do twice the exact same thing if the first attempt failed"
             "```"
         )
 
@@ -268,6 +275,34 @@ class AgentMbpp:
             code = code.split("```")[1].split("```")[0]
         return code.strip()
 
+    @staticmethod
+    def _is_same_code(code_a: str, code_b: str) -> bool:
+        """Compare two candidate solutions ignoring blank lines.
+
+        Used to detect when the model regenerated the exact same
+        (failing) solution again, so the agent can react instead
+        of burning iterations on an identical retry.
+
+        Args:
+            code_a: The first candidate solution.
+            code_b: The second candidate solution.
+
+        Returns:
+            bool: True if both are non-empty and identical once
+            blank lines and surrounding whitespace are ignored.
+        """
+        if not code_a or not code_b:
+            return False
+
+        def _normalize(code: str) -> str:
+            return "\n".join(
+                line.strip()
+                for line in code.strip().splitlines()
+                if line.strip()
+            )
+
+        return _normalize(code_a) == _normalize(code_b)
+
     def _run_evaluation_loop(
         self, llm: Any, sandbox: Any
     ) -> Tuple[bool, str, int, int, List[Dict[str, Any]]]:
@@ -305,19 +340,32 @@ class AgentMbpp:
         success: bool = False
         raw_code: str = ""
         steps: List[Dict[str, Any]] = []
+        # Anti-repetition tracking: if the model regenerates the
+        # exact same failing code again, the next call's
+        # temperature is bumped up so it is pushed out of that
+        # local minimum instead of retrying forever.
+        last_failed_code: str = ""
+        repeat_streak: int = 0
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             print(f"--- Attempt {attempt} / {MAX_ATTEMPTS} ---")
 
-            start_api: float = time.time()
-            try:
-                api_answer: Dict[str, Any] = llm.call_api(
-                    messages_context
+            call_temperature: Optional[float] = None
+            if repeat_streak > 0:
+                call_temperature = min(
+                    MBPP_TEMPERATURE
+                    + REPEAT_TEMPERATURE_STEP * repeat_streak,
+                    REPEAT_TEMPERATURE_MAX,
                 )
-            except RuntimeError as e:
-                print(f"Error: {e}")
-                sys.exit(1)
+                print(
+                    f"Repeated identical code {repeat_streak}x - "
+                    f"bumping temperature to {call_temperature:.2f}"
+                )
 
+            start_api: float = time.time()
+            api_answer: Dict[str, Any] = llm.call_api(
+                messages_context, temperature=call_temperature
+            )
             end_api: float = time.time()
             request_time_ms: float = (end_api - start_api) * 1000
 
@@ -372,14 +420,27 @@ class AgentMbpp:
                 break
 
             print(f"Attempt {attempt} failed.")
+
+            is_repeat = self._is_same_code(raw_code, last_failed_code)
+            repeat_streak = repeat_streak + 1 if is_repeat else 0
+            last_failed_code = raw_code
+
+            if is_repeat:
+                feedback = (
+                    "Your code is IDENTICAL to your previous "
+                    "failed attempt - repeating it will fail the "
+                    "same way again. You MUST try a fundamentally "
+                    "different approach or algorithm, not a minor "
+                    f"tweak.\n\nObservation:\n{log}\n"
+                    "Please fix the errors."
+                )
+            else:
+                feedback = (
+                    f"Observation:\n{log}\nPlease fix the errors."
+                )
+
             messages_context.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"Observation:\n{log}\n"
-                        "Please fix the errors."
-                    ),
-                }
+                {"role": "user", "content": feedback}
             )
 
         return (
