@@ -50,6 +50,33 @@ def _init_sandbox() -> Sandbox:
 
 
 @mcp.tool()
+def run_tests(code: str) -> str:
+    """
+    Run a candidate MBPP solution (plus its appended test harness)
+    safely inside the sandbox and get the result back.
+
+    This is the mandatory MBPP execution tool (subject section
+    V.3.2). ``code`` is expected to already contain both the
+    candidate function and the test assertions appended after it
+    (see ``AgentMbpp._build_test_code``) -- this tool does not build
+    the harness itself, it only runs whatever script it is given
+    inside the sandbox, same as ``execute_python_code``.
+
+    Args:
+        code (str): The complete candidate solution followed by its
+            test assertions.
+
+    Returns:
+        str: The full stdout/stderr captured during execution.
+        Contains the literal marker ``ALL_TESTS_PASSED`` when every
+        assertion succeeded.
+    """
+    sandbox = _init_sandbox()
+    result: Dict[str, Any] = sandbox.execute_code(code)
+    return str(result.get("output", ""))
+
+
+@mcp.tool()
 def execute_python_code(code: str) -> str:
     """
     Execute pure Python code safely inside the sandbox and get output back.

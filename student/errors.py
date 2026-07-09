@@ -18,6 +18,12 @@ class ForbiddenNetworkError(SandboxError):
     pass
 
 
+class ForbiddenFileAccessError(SandboxError):
+    """Levée lorsqu'un chemin hors de ``allowed_directories`` est
+    ouvert par le code exécuté dans la sandbox."""
+    pass
+
+
 class FinalAnswerException(SandboxError):
     """Exception interne pour intercepter l'appel à final_answer."""
     def __init__(self, answer: str):

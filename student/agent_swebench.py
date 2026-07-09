@@ -5,17 +5,14 @@ import sys
 import time
 from typing import Any, Dict, List, Tuple
 from datetime import datetime
-import re
-import asyncio
 import subprocess
 
 from dotenv import load_dotenv
-from pydantic import ValidationError
 from student.agent_config import AgentConfig
+from student.code_extraction import extract_code
+from student.mcp_bridge import MCPBridge
 from student.sandbox import Sandbox
 from student.sandbox_config import SandboxConfig
-from mcp import stdio_client, StdioServerParameters
-from mcp.client.session import ClientSession
 
 load_dotenv()
 
@@ -54,16 +51,21 @@ class AgentSWEBench:
             "- edit_file(filepath, old_str, new_str) -> str\n"
             "- list_files(directory, pattern) -> str\n"
             "- search_code(pattern, file_pattern) -> str\n"
+            "- search_function_or_class_definition_in_code(name) -> str\n"
+            "- find_references(name, filepath, line) -> str\n"
             "- run_tests() -> str\n"
             "- get_patch() -> str\n"
             "- run_command(command, workdir) -> str\n"
             "- final_answer(patch_str) -> None\n\n"
             "STRICT PROTOCOL:\n"
-            "1. NO GUESSING. You must call search_code or read_file to inspect code BEFORE editing.\n"
+            "1. NO GUESSING. You must call search_code, "
+            "search_function_or_class_definition_in_code, or "
+            "read_file to inspect code BEFORE editing.\n"
             "2. Execute exactly ONE tool call per turn inside a single ```python block, then wait.\n"
             "3. NEVER pass empty strings or whitespace as old_str to edit_file.\n"
             "4. IF A TEST FAILS: Analyze the error stack trace, read the breaking file, fix it, and re-run tests.\n"
-            "5. Submit ONLY when run_tests() passes 100% cleanly by calling final_answer(get_patch())."
+            "5. Use find_references before renaming/removing a symbol, to make sure you are not breaking other call sites.\n"
+            "6. Submit ONLY when run_tests() passes 100% cleanly by calling final_answer(get_patch())."
         )
 
         print(f"Model : {self.config.model_name}")
@@ -127,10 +129,18 @@ class AgentSWEBench:
         except OSError as e:
             print(f"OS Error: Cannot write file to {self.config.output}: {e}")
 
-    async def _run_evaluation_loop(
-        self, llm: Any, sandbox: Sandbox, mcp_client: Any, loop: Any
+    def _run_evaluation_loop(
+        self, llm: Any, sandbox: Sandbox, bridge: MCPBridge
     ) -> Tuple[bool, str, int, int, List[Dict[str, Any]]]:
-        """Run the main software engineering loop using Sandbox execution."""
+        """Run the main software engineering loop using Sandbox execution.
+
+        ``bridge`` is a real, connected MCP client (see solve()): the
+        tool calls the LLM's code makes are routed through it to
+        mcp_tools_swebench.py, instead of importing that module
+        directly and bypassing the MCP protocol entirely (the
+        original bug this replaces -- ``mcp_client``/``session`` used
+        to be accepted but never actually used for tool calls).
+        """
         hint_block = ""
         if self.hints_text.strip():
             hint_block = (
@@ -159,37 +169,7 @@ class AgentSWEBench:
         final_patch: str = ""
         steps: List[Dict[str, Any]] = []
 
-        import mcp_tools_swebench
-
-        def call_and_print(func, *args, **kwargs):
-            res = func(*args, **kwargs)
-            print(res)
-            return res
-
-        # Redirection des proxies de la Sandbox vers nos outils Docker MCP découplés
-        injected_tools = {
-            "read_file": lambda filepath, start_line, end_line: call_and_print(
-                mcp_tools_swebench.read_file, filepath, start_line, end_line
-            ),
-            "edit_file": lambda filepath, old_str, new_str: call_and_print(
-                mcp_tools_swebench.edit_file, filepath, old_str, new_str
-            ),
-            "list_files": lambda directory=".", pattern="*": call_and_print(
-                mcp_tools_swebench.list_files, directory, pattern
-            ),
-            "search_code": lambda pattern, file_pattern="*.py": call_and_print(
-                mcp_tools_swebench.search_code, pattern, file_pattern
-            ),
-            "run_tests": lambda: call_and_print(
-                mcp_tools_swebench.run_tests
-            ),
-            "get_patch": lambda: call_and_print(
-                mcp_tools_swebench.get_patch
-            ),
-            "run_command": lambda command, workdir=".": call_and_print(
-                mcp_tools_swebench.run_command, command, workdir
-            ),
-        }
+        injected_tools = bridge.build_tool_proxies()
 
         for attempt in range(1, self.max_iterations + 1):
             print(f"--- SWE-bench Attempt {attempt} / {self.max_iterations} ---")
@@ -214,18 +194,25 @@ class AgentSWEBench:
                 break
 
             llm_text = api_answer.get("text", "")
-            
-            python_blocks = re.findall(r"```python\s*(.*?)\s*```", llm_text, re.DOTALL)
-            if python_blocks:
-                code_to_run = "\n".join(python_blocks)
-            else:
-                code_to_run = llm_text
 
-            print("Executing code in Sandbox...")
-            sandbox_res = sandbox.execute_code(code_to_run.strip(), injected_tools=injected_tools)
-            
-            observation = sandbox_res.get("output", "")
-            is_final = sandbox_res.get("is_final", False)
+            extraction = extract_code(llm_text)
+            if not extraction.found:
+                # No ```python block, no <invoke>, no <tool_call>,
+                # no ReAct pair: tell the model explicitly instead of
+                # silently doing nothing (subject section V.1).
+                code_to_run = ""
+                observation = extraction.note
+                is_final = False
+            else:
+                code_to_run = extraction.code
+                print("Executing code in Sandbox...")
+                sandbox_res = sandbox.execute_code(
+                    code_to_run.strip(), injected_tools=injected_tools
+                )
+                observation = sandbox_res.get("output", "")
+                if extraction.note:
+                    observation = f"{extraction.note}\n\n{observation}"
+                is_final = sandbox_res.get("is_final", False)
 
             messages_context.append({"role": "assistant", "content": llm_text})
             messages_context.append({"role": "user", "content": f"Observation from sandbox execution:\n{observation}"})
@@ -253,7 +240,7 @@ class AgentSWEBench:
 
         return (success, final_patch, total_prompt_tokens, total_completion_tokens, steps)
 
-    async def solve(self) -> None:
+    def solve(self) -> None:
         """Orchestrate container generation, execution, and systematic teardown."""
         llm, sandbox = self._init_tools()
 
@@ -291,31 +278,33 @@ class AgentSWEBench:
         )
         subprocess.run(["docker", "exec", container_name, "chmod", "+x", "/testbed/eval_script.sh"], capture_output=True)
 
-        server_params = StdioServerParameters(
-            command=sys.executable,
-            args=[os.path.abspath("mcp_tools_swebench.py")],
-            cwd=os.path.abspath("."),
-            stderr=sys.stderr
-        )
-
-        current_loop = asyncio.get_running_loop()
+        # MCPBridge owns the real MCP ClientSession on its own
+        # dedicated background thread/event loop -- necessary
+        # because asyncio sessions are bound to the loop that
+        # created them, and Sandbox.execute_code's tool-dispatch
+        # loop below is synchronous (it can't safely `await` on a
+        # session tied to a *different* loop without deadlocking or
+        # violating that thread-affinity). See student/mcp_bridge.py.
+        bridge = MCPBridge()
 
         try:
-            async with stdio_client(server_params) as (read_stream, write_stream):
-                async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
+            bridge.connect_stdio(
+                f"{sys.executable} {os.path.abspath('mcp_tools_swebench.py')}",
+                cwd=os.path.abspath("."),
+            )
 
-                    start_agent = time.time()
-                    (
-                        success,
-                        final_patch,
-                        prompt_tokens,
-                        completion_tokens,
-                        steps,
-                    ) = await self._run_evaluation_loop(llm, sandbox, session, current_loop)
-                    end_agent = time.time()
-                    total_time = end_agent - start_agent
+            start_agent = time.time()
+            (
+                success,
+                final_patch,
+                prompt_tokens,
+                completion_tokens,
+                steps,
+            ) = self._run_evaluation_loop(llm, sandbox, bridge)
+            end_agent = time.time()
+            total_time = end_agent - start_agent
         finally:
+            bridge.close()
             # Garantie contractuelle absolue de nettoyage du conteneur après exécution
             print(f"🧹 Fermeture et suppression du conteneur : {container_name}...")
             subprocess.run(f"docker rm -f {container_name}", shell=True, capture_output=True)
@@ -327,7 +316,7 @@ class AgentSWEBench:
 def main() -> None:
     """Main entry point to execute the SWE-bench agent."""
     agent: AgentSWEBench = AgentSWEBench()
-    asyncio.run(agent.solve())
+    agent.solve()
 
 
 if __name__ == "__main__":
