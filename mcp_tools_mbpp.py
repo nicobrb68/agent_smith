@@ -50,33 +50,6 @@ def _init_sandbox() -> Sandbox:
 
 
 @mcp.tool()
-def run_tests(code: str) -> str:
-    """
-    Run a candidate MBPP solution (plus its appended test harness)
-    safely inside the sandbox and get the result back.
-
-    This is the mandatory MBPP execution tool (subject section
-    V.3.2). ``code`` is expected to already contain both the
-    candidate function and the test assertions appended after it
-    (see ``AgentMbpp._build_test_code``) -- this tool does not build
-    the harness itself, it only runs whatever script it is given
-    inside the sandbox, same as ``execute_python_code``.
-
-    Args:
-        code (str): The complete candidate solution followed by its
-            test assertions.
-
-    Returns:
-        str: The full stdout/stderr captured during execution.
-        Contains the literal marker ``ALL_TESTS_PASSED`` when every
-        assertion succeeded.
-    """
-    sandbox = _init_sandbox()
-    result: Dict[str, Any] = sandbox.execute_code(code)
-    return str(result.get("output", ""))
-
-
-@mcp.tool()
 def execute_python_code(code: str) -> str:
     """
     Execute pure Python code safely inside the sandbox and get output back.
@@ -91,6 +64,43 @@ def execute_python_code(code: str) -> str:
     """
     sandbox = _init_sandbox()
     result: Dict[str, Any] = sandbox.execute_code(code)
+    return str(result.get("output", ""))
+
+
+@mcp.tool()
+def run_tests(code: str, tests: str) -> str:
+    """
+    Run a Python solution against test assertions inside the sandbox.
+
+    Args:
+        code (str): The complete Python solution to test.
+        tests (str): Newline-separated assert statements to execute
+            after the solution code.
+
+    Returns:
+        str: The full stdout and stderr captured during execution,
+            including 'ALL_TESTS_PASSED' on success.
+    """
+    test_lines = [t.strip() for t in tests.strip().splitlines() if t.strip()]
+    harness_parts = [code, "", "__all_tests_passed = True"]
+    for t in test_lines:
+        harness_parts.append("try:")
+        harness_parts.append(f"    {t}")
+        harness_parts.append("except AssertionError:")
+        harness_parts.append(f"    print('Assertion failed: {t}')")
+        harness_parts.append("    __all_tests_passed = False")
+        harness_parts.append("except Exception as e:")
+        harness_parts.append(
+            f"    print(f'Runtime Error during [ {t} ]: "
+            "{type(e).__name__}: {e}')"
+        )
+        harness_parts.append("    __all_tests_passed = False")
+    harness_parts.append("")
+    harness_parts.append("if __all_tests_passed:")
+    harness_parts.append("    print('ALL_TESTS_PASSED')")
+
+    sandbox = _init_sandbox()
+    result: Dict[str, Any] = sandbox.execute_code("\n".join(harness_parts))
     return str(result.get("output", ""))
 
 

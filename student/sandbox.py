@@ -1,5 +1,4 @@
 import builtins
-import ctypes
 import fnmatch
 import io
 import multiprocessing
@@ -14,29 +13,10 @@ from typing import Any, Dict, Callable, List
 from student.sandbox_config import SandboxConfig
 from student.errors import (
     ForbiddenNetworkError,
-    ForbiddenFileAccessError,
+    PathAccessError,
     UnauthorizedImportError,
     FinalAnswerException,
 )
-
-# Builtins removed from the executed namespace only (the sandbox's
-# own `exec(code_str, ...)` call further down keeps using the real,
-# unrestricted builtins) so LLM-generated code cannot re-implement
-# `exec`/`import` from scratch and bypass the import allowlist.
-_DANGEROUS_BUILTINS = ("eval", "exec", "compile", "execfile", "breakpoint")
-
-# A single tool call is truncated past this size before being sent
-# back to the LLM, to avoid blowing the token budget on one
-# Observation (e.g. a runaway `list_files` on a huge repo).
-_MAX_TOOL_OUTPUT_CHARS: int = 20_000
-
-# Size of the shared buffer used to recover partial stdout/stderr
-# when a run is killed on timeout. This is a POSIX shared-memory
-# ctypes array (multiprocessing.Array), NOT a multiprocessing.
-# Manager: a Manager's proxy talks to its server process over a
-# socket, which would itself get blocked by this sandbox's own
-# network restriction as soon as it tries to reconnect after fork.
-_PARTIAL_OUTPUT_BUFFER_SIZE: int = 20_000
 
 
 class Sandbox:
@@ -81,42 +61,6 @@ class Sandbox:
 
         socket.socket = forbidden_socket  # type: ignore[misc, assignment]
 
-    def _restricted_builtins(self) -> Dict[str, Any]:
-        """Build the ``__builtins__`` dict used by the EXECUTED code.
-
-        Starts from a copy of the real builtins (the sandbox's own
-        ``exec(code_str, ...)`` call right after this still uses the
-        real, unrestricted builtins -- this is only a copy), strips
-        the dangerous entries in ``_DANGEROUS_BUILTINS``, and wraps
-        ``open`` so filesystem access is limited to
-        ``self.config.allowed_directories``.
-        """
-        restricted: Dict[str, Any] = dict(sys.modules["builtins"].__dict__)
-        for name in _DANGEROUS_BUILTINS:
-            restricted.pop(name, None)
-
-        real_open = restricted.get("open", open)
-        allowed_dirs: List[str] = [
-            os.path.abspath(d) for d in self.config.allowed_directories
-        ]
-
-        def restricted_open(file: Any, *args: Any, **kwargs: Any) -> Any:
-            if isinstance(file, (str, bytes, os.PathLike)):
-                abs_path = os.path.abspath(os.fspath(file))
-                is_allowed = any(
-                    abs_path == d or abs_path.startswith(d + os.sep)
-                    for d in allowed_dirs
-                )
-                if not is_allowed:
-                    raise ForbiddenFileAccessError(
-                        f"Access denied: '{file}' is outside the "
-                        f"allowed directories {allowed_dirs}."
-                    )
-            return real_open(file, *args, **kwargs)
-
-        restricted["open"] = restricted_open
-        return restricted
-
     def execute_code(
         self,
         code_str: str,
@@ -130,14 +74,6 @@ class Sandbox:
 
         tools_to_inject = injected_tools or {}
 
-        # Shared-memory buffer (see module docstring for why not a
-        # Manager) so a killed-on-timeout run can still report
-        # whatever it had printed so far, instead of nothing.
-        partial_buffer = multiprocessing.Array(
-            ctypes.c_wchar, _PARTIAL_OUTPUT_BUFFER_SIZE, lock=True
-        )
-        partial_buffer[:] = ["\x00"] * _PARTIAL_OUTPUT_BUFFER_SIZE
-
         proxy_tools = {}
         for tool_name in tools_to_inject.keys():
             def make_proxy(name: str) -> Callable[..., Any]:
@@ -148,37 +84,42 @@ class Sandbox:
             proxy_tools[tool_name] = make_proxy(tool_name)
 
         def agent_routine(tools_dict: Dict[str, Callable[..., Any]]) -> None:
-            class _SharedWriter(io.StringIO):
-                """Mirrors every write to ``partial_buffer`` so the
-                parent can recover partial output if this process
-                gets killed on timeout."""
-
-                def write(self, s: str) -> int:
-                    n = super().write(s)
-                    try:
-                        tail = self.getvalue()[-_PARTIAL_OUTPUT_BUFFER_SIZE:]
-                        with partial_buffer.get_lock():
-                            partial_buffer[:len(tail)] = list(tail)
-                            remaining = (
-                                _PARTIAL_OUTPUT_BUFFER_SIZE - len(tail)
-                            )
-                            if remaining > 0:
-                                partial_buffer[len(tail):] = (
-                                    ["\x00"] * remaining
-                                )
-                    except Exception:
-                        pass
-                    return n
-
-            get_print = _SharedWriter()
+            get_print = io.StringIO()
             sys.stdout = get_print
             sys.stderr = get_print
 
             try:
                 self._apply_restrictions()
 
+                safe_builtins = dict(sys.modules["builtins"].__dict__)
+
+                for dangerous in ("exec", "eval", "compile",
+                                  "breakpoint", "exit", "quit"):
+                    safe_builtins.pop(dangerous, None)
+
+                allowed_dirs: List[str] = list(
+                    self.config.allowed_directories or []
+                )
+                if allowed_dirs:
+                    _real_open = open
+
+                    def safe_open(
+                        file: Any, *args: Any, **kwargs: Any
+                    ) -> Any:
+                        path = os.path.abspath(str(file))
+                        for d in allowed_dirs:
+                            if path.startswith(os.path.abspath(d)):
+                                break
+                        else:
+                            raise PathAccessError(
+                                f"Access denied: {path}"
+                            )
+                        return _real_open(file, *args, **kwargs)
+
+                    safe_builtins["open"] = safe_open
+
                 execution_globals: Dict[str, Any] = (
-                    {"__builtins__": self._restricted_builtins()})
+                    {"__builtins__": safe_builtins})
 
                 for tool_name, tool_proxy in tools_dict.items():
                     execution_globals[tool_name] = tool_proxy
@@ -201,15 +142,6 @@ class Sandbox:
                     "is_final": True,
                     "output": get_print.getvalue(),
                     "solution": fae.answer,
-                })
-            except SyntaxError as e:
-                queue.put({
-                    "success": False,
-                    "is_final": False,
-                    "output": f"{get_print.getvalue()}\n"
-                    f"SyntaxError: the submitted code block is not "
-                    f"valid Python and could not be executed: {e}",
-                    "solution": "",
                 })
             except BaseException as e:
                 if isinstance(e, (KeyboardInterrupt, SystemExit)):
@@ -236,19 +168,10 @@ class Sandbox:
             if elapsed > timeout:
                 process.terminate()
                 process.join()
-                with partial_buffer.get_lock():
-                    partial_output = "".join(
-                        partial_buffer[:]
-                    ).split("\x00", 1)[0]
                 return {
                     "success": False,
                     "is_final": False,
-                    "output": (
-                        "Timeout Error: execution exceeded the "
-                        f"{timeout:.0f}s limit and was killed. The "
-                        "output below is PARTIAL (whatever was "
-                        f"printed before the kill):\n{partial_output}"
-                    ),
+                    "output": "Timeout Error: Execution exceeded limit.",
                     "solution": "",
                 }
 
@@ -263,14 +186,6 @@ class Sandbox:
                         res = f"Error executing tool {t_name}: {str(err)}"
                 else:
                     res = f"Error: Tool {t_name} not found."
-
-                if isinstance(res, str) and len(res) > _MAX_TOOL_OUTPUT_CHARS:
-                    res = (
-                        res[:_MAX_TOOL_OUTPUT_CHARS]
-                        + "\n... [TRUNCATED: tool output exceeded "
-                        f"{_MAX_TOOL_OUTPUT_CHARS} characters and was "
-                        "cut here to save tokens]"
-                    )
 
                 response_queue.put(res)
             except Empty:

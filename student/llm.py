@@ -15,12 +15,6 @@ DEFAULT_TEMPERATURE: float = 0.0
 DEFAULT_TOP_P: float = 0.95
 DEFAULT_MAX_TOKENS: int = 4096
 
-# Sent as the OpenAI-compatible `stop` parameter so the model stops
-# generating the instant it finishes a code block, instead of
-# continuing on to hallucinate a fake "Observation:" of its own (the
-# subject explicitly calls this out in section V.6).
-DEFAULT_STOP_SEQUENCES: List[str] = ["<end_code>", "\nObservation:"]
-
 
 class TokenRotator:
     """Handle automatic multi-key, multi-provider rotation."""
@@ -98,7 +92,6 @@ class LLMClient:
         temperature: float = DEFAULT_TEMPERATURE,
         top_p: float = DEFAULT_TOP_P,
         max_tokens: int = DEFAULT_MAX_TOKENS,
-        stop_sequences: Optional[List[str]] = None,
     ) -> None:
         """Store the rotator and the default sampling settings.
 
@@ -110,10 +103,6 @@ class LLMClient:
                 that do not override it explicitly.
             top_p: Default nucleus-sampling value.
             max_tokens: Default max tokens per completion.
-            stop_sequences: Strings that make the API stop as soon
-                as they are produced, so the model can't hallucinate
-                a fake Observation after its code block. Defaults to
-                ``DEFAULT_STOP_SEQUENCES``; pass ``[]`` to disable.
         """
         self.rotator = rotator
         self.cli_url = provider_url
@@ -121,10 +110,6 @@ class LLMClient:
         self.temperature = temperature
         self.top_p = top_p
         self.max_tokens = max_tokens
-        self.stop_sequences = (
-            DEFAULT_STOP_SEQUENCES if stop_sequences is None
-            else stop_sequences
-        )
 
     def call_api(
         self,
@@ -189,8 +174,6 @@ class LLMClient:
                     "top_p": self.top_p,
                     "max_tokens": self.max_tokens,
                 }
-                if self.stop_sequences:
-                    kwargs["stop"] = self.stop_sequences
                 if tools:
                     kwargs["tools"] = tools
 

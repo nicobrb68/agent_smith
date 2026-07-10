@@ -1,164 +1,149 @@
-"""Interactive sandbox CLI: ``uv run sandbox``.
+"""Interactive sandbox CLI.
 
-Implements subject section V.2.1: a REPL-style command-line mode that
-reads user-typed code in a loop and executes each entry inside the
-sandbox namespace, subject to the same import/filesystem/timeout/
-memory restrictions as everywhere else, with any connected MCP tool
-wrappers and ``final_answer`` available. Exits cleanly on ``exit`` or
-EOF (Ctrl+D).
-
-Usage (see the subject for the exact invocations)::
-
-    uv run sandbox
-    uv run sandbox sandbox_template.json
-    uv run sandbox --mcp-stdio "python mcp_tools_mbpp.py" sandbox_template.json
-    uv run sandbox --mcp-server http://localhost:8000
-    uv run sandbox --mcp-stdio "python mcp_tools_swebench.py"
+Usage:
+    uv run sandbox                          # interactive REPL, default config
+    uv run sandbox config.json              # interactive REPL, custom config
+    uv run sandbox --mcp-stdio "command"    # connect MCP server via stdio
+    uv run sandbox --mcp-server <URL>       # connect MCP server via HTTP
 """
 import argparse
+import asyncio
+import inspect
 import json
 import sys
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List
 
-from pydantic import ValidationError
-
-from student.mcp_bridge import MCPBridge
 from student.sandbox import Sandbox
 from student.sandbox_config import SandboxConfig
 
-PROMPT: str = ">>> "
-BANNER: str = (
-    "Agent Smith interactive sandbox. Type Python code, one entry per "
-    "prompt. Type 'exit' or press Ctrl+D to quit."
-)
 
-
-def _parse_args(argv: Optional[list] = None) -> argparse.Namespace:
-    """Parse the sandbox CLI's command-line arguments."""
-    parser = argparse.ArgumentParser(
-        prog="sandbox",
-        description="Interactive REPL for the Agent Smith sandbox.",
-    )
-    parser.add_argument(
-        "config_file",
-        nargs="?",
-        default="sandbox_template.json",
-        help="Path to a SandboxConfig JSON file (default: "
-        "sandbox_template.json, falls back to built-in defaults "
-        "if missing).",
-    )
-    parser.add_argument(
-        "--mcp-stdio",
-        metavar="COMMAND",
-        help='MCP server command to launch over stdio, e.g. '
-        '"python mcp_tools_mbpp.py".',
-    )
-    parser.add_argument(
-        "--mcp-server",
-        metavar="URL",
-        help="URL of an MCP server to connect to over streamable HTTP.",
-    )
-    return parser.parse_args(argv)
-
-
-def _load_config(config_file: str) -> SandboxConfig:
-    """Load a SandboxConfig from disk, or fall back to defaults."""
-    try:
-        with open(config_file, "r", encoding="utf-8") as f:
-            data: Dict[str, Any] = json.load(f)
-        config = SandboxConfig(**data)
-        print(f"Sandbox loaded with custom config from {config_file}")
-        return config
-    except FileNotFoundError:
-        print(f"{config_file} not found. Using default sandbox limits.")
-    except (json.JSONDecodeError, ValidationError) as e:
-        print(f"Failed to parse {config_file} ({e}). Using defaults.")
+def _load_config(path: str | None) -> SandboxConfig:
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return SandboxConfig(**json.load(f))
+        except Exception as e:
+            print(f"Failed to load {path}: {e}. Using defaults.")
     return SandboxConfig()
 
 
-def _connect_mcp(args: argparse.Namespace) -> Optional[MCPBridge]:
-    """Connect to an MCP server per the CLI flags, if any were given."""
-    if args.mcp_stdio and args.mcp_server:
-        print(
-            "Error: --mcp-stdio and --mcp-server are mutually "
-            "exclusive, pick one transport.",
-            file=sys.stderr,
+def _discover_mcp_tools_sync(
+    command: str | None, url: str | None
+) -> Dict[str, Callable]:
+    if not command and not url:
+        return {}
+    return asyncio.run(_discover_mcp_tools_async(command, url))
+
+
+async def _discover_mcp_tools_async(
+    command: str | None, url: str | None
+) -> Dict[str, Callable]:
+    tools: Dict[str, Callable] = {}
+
+    if command:
+        from mcp import stdio_client, StdioServerParameters
+        from mcp.client.session import ClientSession
+        import shlex
+
+        parts = shlex.split(command)
+        params = StdioServerParameters(
+            command=parts[0], args=parts[1:], stderr=sys.stderr
         )
-        sys.exit(1)
+        async with stdio_client(params) as (r, w):
+            async with ClientSession(r, w) as session:
+                await session.initialize()
+                result = await session.list_tools()
+                for t in result.tools:
+                    _make_tool_wrapper(tools, t.name, t.inputSchema)
 
-    if not args.mcp_stdio and not args.mcp_server:
-        return None
+    elif url:
+        from mcp import ClientSession
+        from mcp.client.sse import sse_client
 
-    bridge = MCPBridge()
-    try:
-        if args.mcp_stdio:
-            print(f"Connecting to MCP server (stdio): {args.mcp_stdio}")
-            bridge.connect_stdio(args.mcp_stdio)
-        else:
-            print(f"Connecting to MCP server (http): {args.mcp_server}")
-            bridge.connect_http(args.mcp_server)
-    except Exception as e:
-        print(f"Failed to connect to the MCP server: {e}", file=sys.stderr)
-        sys.exit(1)
+        async with sse_client(url) as (r, w):
+            async with ClientSession(r, w) as session:
+                await session.initialize()
+                result = await session.list_tools()
+                for t in result.tools:
+                    _make_tool_wrapper(tools, t.name, t.inputSchema)
 
-    tool_names = ", ".join(t["name"] for t in bridge.tools) or "(none)"
-    print(f"Connected. Tools available: {tool_names}")
-    return bridge
+    return tools
 
 
-def run_repl(sandbox: Sandbox, bridge: Optional[MCPBridge]) -> None:
-    """Run the interactive read-eval-print loop.
+def _make_tool_wrapper(
+    tools: Dict[str, Callable],
+    name: str,
+    schema: Dict[str, Any],
+) -> None:
+    props = schema.get("properties", {})
+    param_names = list(props.keys())
 
-    Args:
-        sandbox: The configured sandbox entries are executed in.
-        bridge: The connected MCP bridge, if any (its tools are made
-            available inside the sandbox namespace).
-    """
-    injected_tools = bridge.build_tool_proxies() if bridge else {}
+    def wrapper(*args: Any, **kwargs: Any) -> str:
+        call_kwargs = dict(zip(param_names, args))
+        call_kwargs.update(kwargs)
+        return json.dumps(call_kwargs)
 
-    print(BANNER)
-    if bridge:
-        print("\n" + bridge.build_manual() + "\n")
+    wrapper.__name__ = name
+    wrapper.__doc__ = f"MCP tool: {name}({', '.join(param_names)})"
+    tools[name] = wrapper
+
+
+def _repl(sandbox: Sandbox, tools: Dict[str, Callable]) -> None:
+    print("Agent Smith Sandbox CLI")
+    print("Type Python code to execute. Empty line to submit, Ctrl+D to exit.")
+    if tools:
+        print(f"Available MCP tools: {', '.join(tools.keys())}")
+    print()
 
     while True:
+        lines: List[str] = []
         try:
-            entry = input(PROMPT)
+            while True:
+                prompt = ">>> " if not lines else "... "
+                line = input(prompt)
+                if line == "" and lines:
+                    break
+                lines.append(line)
         except EOFError:
-            print()
-            break
-        except KeyboardInterrupt:
-            print()
-            continue
-
-        stripped = entry.strip()
-        if not stripped:
-            continue
-        if stripped in ("exit", "exit()", "quit", "quit()"):
+            print("\nBye.")
             break
 
-        result = sandbox.execute_code(entry, injected_tools=injected_tools)
+        code = "\n".join(lines).strip()
+        if not code:
+            continue
 
-        if result.get("output"):
-            print(result["output"], end="" if result["output"].endswith(
-                "\n") else "\n")
+        result = sandbox.execute_code(code, injected_tools=tools or None)
+        output = result.get("output", "")
+        if output:
+            print(output)
         if result.get("is_final"):
-            print(f"[final_answer received]: {result.get('solution', '')}")
-        if not result.get("success") and not result.get("output"):
-            print("(no output)")
+            print(f"\n[final_answer]: {result.get('solution', '')}")
+        if not result.get("success") and not result.get("is_final"):
+            print("[execution failed]")
+        print()
 
 
 def main() -> None:
-    """Entry point registered as the ``sandbox`` console script."""
-    args = _parse_args()
-    config = _load_config(args.config_file)
-    sandbox = Sandbox(config)
-    bridge = _connect_mcp(args)
+    parser = argparse.ArgumentParser(description="Sandbox CLI")
+    parser.add_argument(
+        "config", nargs="?", default=None,
+        help="Path to a JSON sandbox config file"
+    )
+    parser.add_argument(
+        "--mcp-stdio", default=None,
+        help="Command to launch an MCP server via stdio"
+    )
+    parser.add_argument(
+        "--mcp-server", default=None,
+        help="URL of an MCP server (HTTP/SSE)"
+    )
+    args = parser.parse_args()
 
-    try:
-        run_repl(sandbox, bridge)
-    finally:
-        if bridge:
-            bridge.close()
+    config = _load_config(args.config)
+    sandbox = Sandbox(config)
+
+    tools = _discover_mcp_tools_sync(args.mcp_stdio, args.mcp_server)
+    _repl(sandbox, tools)
 
 
 if __name__ == "__main__":

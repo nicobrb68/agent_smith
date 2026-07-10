@@ -131,7 +131,6 @@ def edit_file(filepath: str, old_str: str, new_str: str) -> str:
     target_path = normalize_container_path(filepath)
 
     code = f"""
-import ast
 import sys
 try:
     with open({repr(target_path)}, 'r', encoding='utf-8') as f:
@@ -145,19 +144,7 @@ try:
     new_content = content.replace({repr(old_str)}, {repr(new_str)})
     with open({repr(target_path)}, 'w', encoding='utf-8') as f:
         f.write(new_content)
-
-    message = "File edited successfully."
-    if {repr(target_path)}.endswith('.py'):
-        try:
-            ast.parse(new_content)
-        except SyntaxError as syn_err:
-            message += (
-                "\\nWARNING: the edit was applied, but the file no "
-                "longer parses as valid Python "
-                f"(SyntaxError: {{syn_err}}). You likely need to fix "
-                "or revert this edit."
-            )
-    print(message)
+    print("File edited successfully.")
 except Exception as e:
     print(f"Error: {{e}}", file=sys.stderr)
     sys.exit(1)
@@ -263,162 +250,6 @@ for root, dirs, files in os.walk('/testbed'):
         capture_output=True,
     )
     return res.stdout if res.stdout.strip() else "No matches found."
-
-
-@mcp.tool()
-def search_function_or_class_definition_in_code(name: str) -> str:
-    """Find where a function or class is defined in the codebase.
-
-    Parses every ``.py`` file under /testbed with the ``ast`` module
-    and looks for a ``def``/``async def``/``class`` matching ``name``
-    exactly (unlike search_code, this will not match partial/
-    substring hits, and ignores definitions inside strings/comments).
-
-    Args:
-        name: The exact function or class name to look for.
-
-    Returns:
-        str: One ``path:line: content`` entry per definition found,
-        or a "not found" message.
-    """
-    container = get_container()
-
-    code = """
-import sys, os, ast
-
-name = sys.argv[1]
-results = []
-
-for root, dirs, files in os.walk('/testbed'):
-    for file in files:
-        if not file.endswith('.py'):
-            continue
-        full_path = os.path.join(root, file)
-        rel_path = os.path.relpath(full_path, '/testbed')
-        try:
-            with open(full_path, 'r', encoding='utf-8') as f:
-                source = f.read()
-            tree = ast.parse(source, filename=full_path)
-        except Exception:
-            continue
-        lines = source.splitlines()
-        for node in ast.walk(tree):
-            is_def = isinstance(
-                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-            )
-            if is_def and node.name == name:
-                lineno = node.lineno
-                content = (
-                    lines[lineno - 1].strip()
-                    if 0 < lineno <= len(lines)
-                    else ""
-                )
-                results.append(f"{rel_path}:{lineno}: {content}")
-
-for r in results:
-    print(r)
-"""
-    res = subprocess.run(
-        ["docker", "exec", "-i", container, "python3", "-", name],
-        input=code,
-        text=True,
-        capture_output=True,
-    )
-    output = res.stdout if res.returncode == 0 else res.stderr
-    return (
-        output.strip()
-        if output.strip()
-        else f"No definition found for '{name}'."
-    )
-
-
-@mcp.tool()
-def find_references(name: str, filepath: str, line: int) -> str:
-    """Find usages of a symbol (function or class) in the codebase.
-
-    Uses ``jedi`` for accurate, scope-aware reference resolution when
-    it is available inside the container (install it first with e.g.
-    ``run_command("pip install jedi")``). Falls back to a whole-word
-    text search across the repository otherwise -- less precise (it
-    cannot resolve scoping/shadowing between same-named symbols in
-    different modules) but it never fails outright.
-
-    Args:
-        name: The exact symbol name to search for.
-        filepath: Path to the file where the symbol is defined,
-            relative to /testbed or absolute (used by jedi to
-            resolve the right definition when available).
-        line: 1-indexed line number of the symbol's definition
-            (used the same way as ``filepath``).
-
-    Returns:
-        str: One ``path:line: content`` entry per usage found, or a
-        "no references found" message.
-    """
-    container = get_container()
-    target_path = normalize_container_path(filepath)
-
-    code = """
-import sys, os, re
-
-name = sys.argv[1]
-filepath = sys.argv[2]
-line = int(sys.argv[3])
-used_jedi = False
-
-try:
-    import jedi
-    with open(filepath, 'r', encoding='utf-8') as f:
-        source = f.read()
-    script = jedi.Script(code=source, path=filepath)
-    refs = script.get_references(line=line, column=0, include_builtins=False)
-    if refs:
-        used_jedi = True
-        for ref in refs:
-            content = ""
-            try:
-                with open(ref.module_path, 'r', encoding='utf-8') as rf:
-                    rlines = rf.readlines()
-                if 0 < ref.line <= len(rlines):
-                    content = rlines[ref.line - 1].strip()
-            except Exception:
-                pass
-            rel = os.path.relpath(ref.module_path, '/testbed')
-            print(f"{rel}:{ref.line}: {content}")
-except Exception:
-    pass
-
-if not used_jedi:
-    pattern = re.compile(r'\\b' + re.escape(name) + r'\\b')
-    for root, dirs, files in os.walk('/testbed'):
-        for file in files:
-            if not file.endswith('.py'):
-                continue
-            full_path = os.path.join(root, file)
-            rel_path = os.path.relpath(full_path, '/testbed')
-            try:
-                with open(full_path, 'r', encoding='utf-8') as f:
-                    for num, text in enumerate(f, 1):
-                        if pattern.search(text):
-                            print(f"{rel_path}:{num}: {text.strip()}")
-            except Exception:
-                continue
-"""
-    res = subprocess.run(
-        [
-            "docker", "exec", "-i", container, "python3", "-",
-            name, target_path, str(line),
-        ],
-        input=code,
-        text=True,
-        capture_output=True,
-    )
-    output = res.stdout if res.returncode == 0 else res.stderr
-    return (
-        output.strip()
-        if output.strip()
-        else f"No references found for '{name}'."
-    )
 
 
 def _preserve_result_lines(
@@ -559,6 +390,86 @@ def run_command(command: str, workdir: str = ".") -> str:
         f"EXIT CODE: {res.returncode}\n"
         f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
     )
+
+
+@mcp.tool()
+def search_function_or_class_definition_in_code(name: str) -> str:
+    """Find where a function or class is defined in the codebase.
+
+    Args:
+        name: The exact function or class name to search for.
+
+    Returns:
+        str: Matching definition lines with file path and line
+        number, or a "no definitions found" message.
+    """
+    container = get_container()
+
+    code = f"""
+import os, re
+pattern = re.compile(r'^(\\s*)(def|class)\\s+{re.escape(name)}\\b')
+for root, dirs, files in os.walk('/testbed'):
+    for f in files:
+        if not f.endswith('.py'):
+            continue
+        full = os.path.join(root, f)
+        rel = os.path.relpath(full, '/testbed')
+        try:
+            with open(full, 'r', encoding='utf-8') as fh:
+                for num, line in enumerate(fh, 1):
+                    if pattern.match(line):
+                        print(f"{{rel}}:{{num}}: {{line.rstrip()}}")
+        except Exception:
+            continue
+"""
+    res = subprocess.run(
+        ["docker", "exec", "-i", container, "python3"],
+        input=code,
+        text=True,
+        capture_output=True,
+    )
+    return res.stdout if res.stdout.strip() else "No definitions found."
+
+
+@mcp.tool()
+def find_references(name: str, filepath: str = "", line: int = 0) -> str:
+    """Find all references to a symbol in the codebase.
+
+    Args:
+        name: The symbol name to search for.
+        filepath: Optional file path hint (unused for now, reserved
+            for future scope narrowing).
+        line: Optional line number hint (unused for now).
+
+    Returns:
+        str: Matching reference lines with file path and line
+        number, or a "no references found" message.
+    """
+    container = get_container()
+
+    code = f"""
+import os
+for root, dirs, files in os.walk('/testbed'):
+    for f in files:
+        if not f.endswith('.py'):
+            continue
+        full = os.path.join(root, f)
+        rel = os.path.relpath(full, '/testbed')
+        try:
+            with open(full, 'r', encoding='utf-8') as fh:
+                for num, line in enumerate(fh, 1):
+                    if {repr(name)} in line:
+                        print(f"{{rel}}:{{num}}: {{line.rstrip()}}")
+        except Exception:
+            continue
+"""
+    res = subprocess.run(
+        ["docker", "exec", "-i", container, "python3"],
+        input=code,
+        text=True,
+        capture_output=True,
+    )
+    return res.stdout if res.stdout.strip() else "No references found."
 
 
 if __name__ == "__main__":

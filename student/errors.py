@@ -18,9 +18,8 @@ class ForbiddenNetworkError(SandboxError):
     pass
 
 
-class ForbiddenFileAccessError(SandboxError):
-    """Levée lorsqu'un chemin hors de ``allowed_directories`` est
-    ouvert par le code exécuté dans la sandbox."""
+class PathAccessError(SandboxError):
+    """Raised when code tries to access a path outside allowed directories."""
     pass
 
 

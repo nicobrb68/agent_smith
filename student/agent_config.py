@@ -9,6 +9,10 @@ class AgentConfig:
         parser.add_argument("--output", required=True, help="")
         parser.add_argument("--model-name", required=True, help="")
         parser.add_argument("--provider-url", required=True, help="")
+        parser.add_argument(
+            "--max-iterations", type=int, default=None,
+            help="Override the default max iteration count"
+        )
 
         args = parser.parse_args()
 
@@ -16,3 +20,4 @@ class AgentConfig:
         self.output = args.output
         self.model_name = args.model_name
         self.provider_url = args.provider_url
+        self.max_iterations = args.max_iterations

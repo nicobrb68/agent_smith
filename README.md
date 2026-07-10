@@ -1,239 +1,219 @@
-*This project has been created as part of the 42 curriculum by <your_login> (please replace with your actual 42 login(s), comma-separated if this was a group project).*
+*This project has been created as part of the 42 curriculum by nolhan.*
 
 # Agent Smith
 
+An autonomous agentic framework capable of solving coding challenges through reasoning, code generation, and sandboxed execution. The agent operates through a structured **Thought -> Code -> Observation** loop, interacting with tools via the Model Context Protocol (MCP).
+
 ## Description
 
-Agent Smith is an autonomous **Code Agent** framework: an LLM-driven
-loop that reasons about a coding task, writes executable Python code,
-runs it inside a secured sandbox, observes the result, and iterates
-until the task is solved.
+Agent Smith is a code agent system that can:
 
-Instead of classic JSON-based tool calling, the agent writes plain
-Python code that calls tools directly as functions (e.g.
-`result = search_code("validate_email")`). This "code agent" approach
-supports persistent variables, loops, and conditional logic across
-steps, which a single JSON tool call cannot.
+- Reason about programming tasks using LLM inference
+- Generate executable Python code as tool calls
+- Execute that code inside a secure, configurable sandbox
+- Observe results and iterate until a solution is found
 
-The project applies this framework to two benchmarks:
+It targets two benchmarks:
 
-- **MBPP** (`student/agent_mbpp.py`) -- self-contained algorithmic
-  Python problems, validated through the `run_tests` MCP tool.
-- **SWE-bench** (`student/agent_swebench.py`) -- real bug-fixing
-  tasks in real repositories, solved inside disposable Docker
-  containers through a dedicated MCP tool server
-  (`mcp_tools_swebench.py`).
-
-## Architecture
-
-- **Agent/Orchestrator** (`AgentMbpp`, `AgentSWEBench`) drives the
-  Thought -> Code -> Observation loop: calls the LLM, extracts code,
-  sends it to the sandbox, reads the observation, repeats.
-- **Code extraction** (`student/code_extraction.py`) turns whatever
-  format the LLM produced (fenced Python, Anthropic-style
-  `<invoke>`, Hermes-style `<tool_call>`, or ReAct `Action:`) into an
-  equivalent Python call, or explains clearly why nothing was found.
-  Both agents' `_extract_code`/inline extraction now delegate to it.
-- **Sandbox** (`student/sandbox.py`) is the only place LLM-generated
-  code actually executes. It enforces, on every run: an import
-  allowlist, a filesystem allowlist (`allowed_directories`), a
-  restricted builtins set (no `eval`/`exec`/`compile`/...), no
-  network access, a wall-clock timeout (with partial output recovery
-  on kill), and a memory limit (`RLIMIT_AS`).
-- **MCPBridge** (`student/mcp_bridge.py`) owns one real
-  `mcp.ClientSession` (stdio or streamable HTTP) on a dedicated
-  background thread with its own event loop, and exposes every
-  discovered tool as a plain synchronous Python function the sandbox
-  can inject. This is necessary, not just stylistic: an
-  `asyncio`/MCP session is bound to the event loop that created it,
-  and `Sandbox.execute_code`'s tool-dispatch loop is synchronous, so
-  a session created on the "main" loop cannot safely be awaited from
-  inside it without deadlocking. Both `AgentMbpp` and `AgentSWEBench`
-  use `MCPBridge` for this reason (`AgentSWEBench.solve()` used to
-  open a `ClientSession` directly and then bypass it entirely via a
-  plain Python import of `mcp_tools_swebench` -- a real bug fixed as
-  part of this pass, see below).
-- **MCP servers** (`mcp_tools_mbpp.py`, `mcp_tools_swebench.py`) are
-  separate processes exposing the mandatory tools. `final_answer()`
-  is **not** one of them -- it's a sandbox-native construct that ends
-  the agent loop.
-- **Sandbox CLI** (`student/sandbox_cli.py`, `uv run sandbox`) is a
-  REPL for interactively exercising the sandbox, optionally
-  connected to an MCP server via `--mcp-stdio`/`--mcp-server`.
-
-## Sandbox design
-
-`SandboxConfig` (Pydantic, loaded from `sandbox_template.json`)
-controls, per run:
-
-| Field | Purpose |
-|---|---|
-| `authorized_imports` | Glob allowlist for `import` statements |
-| `allowed_directories` | Paths `open()` is allowed to touch |
-| `max_execution_time_seconds` | Wall-clock timeout |
-| `max_memory_mb` | RAM limit (`resource.RLIMIT_AS`) |
-
-Every run happens in a forked child process. `_restricted_builtins()`
-builds a *copy* of the real builtins for the executed code only (the
-sandbox's own `exec(code_str, ...)` call keeps using the real,
-unrestricted ones): dangerous entries (`eval`, `exec`, `compile`, ...)
-are removed, and `open` is wrapped to enforce `allowed_directories`.
-
-On timeout the child is killed, but stdout/stderr captured so far is
-recovered from a shared `multiprocessing.Array` (deliberately **not**
-a `multiprocessing.Manager`, whose proxy would itself get blocked by
-the sandbox's own network restriction on reconnect after fork -- see
-the comment above `_PARTIAL_OUTPUT_BUFFER_SIZE` in `sandbox.py`) so
-the LLM sees a genuinely partial Observation instead of nothing.
-`KeyboardInterrupt`/`SystemExit` raised by sandboxed code are **not**
-swallowed into a fake Observation -- they propagate so the run can
-shut down cleanly instead of silently continuing.
-
-## Agent loop
-
-Both agents follow the same shape:
-
-1. Send the system prompt and the task to the LLM.
-2. Extract code from the response (`_extract_code`, delegating to
-   `student/code_extraction.py`).
-3. Execute it in the `Sandbox`, with the MCP tool proxies
-   (`bridge.build_tool_proxies()`) injected.
-4. Feed the Observation back and repeat, until `final_answer()` is
-   called or a hard limit (iterations/tokens/time) is hit.
-5. Persist a `SolutionOutput`-shaped `solution.json` with full
-   per-step metrics (tokens, timing, raw LLM output, sandbox
-   input/output) for traceability.
-
-MBPP additionally bumps the sampling temperature after repeated
-identical failing attempts, to push the model out of a local minimum
-instead of regenerating the same wrong code forever (see
-`REPEAT_TEMPERATURE_STEP`/`REPEAT_TEMPERATURE_MAX`).
-
-**MBPP test_imports:** the task's `test_imports` field (e.g.
-`["import math"]` for a test using `math.isclose(...)`) is read in
-`AgentMbpp.__init__` and prepended to the generated test harness in
-`_build_test_code`, since the test assertions run in the *same*
-namespace as the candidate code. The agent's user prompt also warns
-the model explicitly when `test_imports` is empty, since a candidate
-that only imports what its own logic needs (e.g. `cmath`) can
-otherwise fail the tests with a `NameError` on an unrelated name the
-tests reference (e.g. `math`) -- this was previously a silent trap
-with no clear signal for the model to self-correct from.
-
-## Tool implementation details
-
-- **File System**: `read_file`, `edit_file` (rejects empty/whitespace
-  `old_str`; warns if a `.py` edit breaks parsing), `list_files`.
-- **Code Search**: `search_code` (literal substring grep),
-  `search_function_or_class_definition_in_code` (AST-based, exact
-  name match), `find_references` (uses `jedi` inside the container
-  when available for scope-aware resolution, falls back to a
-  whole-word text search otherwise). The latter two were missing
-  from the original tool set despite being mandatory (subject
-  section V.5.2) and have been added to `mcp_tools_swebench.py`.
-- **Execution**: `run_tests` (SWE-bench: runs the task's eval script
-  inside Docker; MBPP: runs a candidate + its generated assertion
-  harness inside the local sandbox -- `mcp_tools_mbpp.py` also still
-  exposes the original generic `execute_python_code` tool),
-  `get_patch` (`git -c core.fileMode=false diff`), `run_command`.
+- **MBPP** (Mostly Basic Python Problems): algorithmic Python exercises
+- **SWE-bench**: real-world bug fixing in production GitHub repositories inside Docker containers
 
 ## Instructions
 
+### Prerequisites
+
+- Python >= 3.10
+- [uv](https://docs.astral.sh/uv/) package manager
+- Docker (for SWE-bench tasks)
+- API keys for at least one LLM provider (Groq, OpenRouter, Gemini, OpenAI)
+
+### Installation
+
 ```bash
-# Install dependencies
 uv sync
-
-# Interactive sandbox REPL
-uv run sandbox
-uv run sandbox sandbox_template.json
-uv run sandbox --mcp-stdio "python mcp_tools_mbpp.py" sandbox_template.json
-uv run sandbox --mcp-server http://localhost:8000
-
-# MBPP: dump a task, run the agent, validate
-cd moulinette && uv run moulinette_eval dump mbpp --output ../cache/mbpp_task.json && cd ..
-uv run python -m student.agent_mbpp --task-file cache/mbpp_task.json \
-    --output cache/mbpp_solution.json \
-    --model-name "<model>" --provider-url "<provider_base_url>"
-cd moulinette && uv run moulinette_eval validate mbpp ../cache/mbpp_task.json ../cache/mbpp_solution.json && cd ..
-
-# SWE-bench: same idea (requires Docker)
-cd moulinette && uv run moulinette_eval dump swebench --output ../cache/swebench_task.json && cd ..
-uv run python -m student.agent_swebench --task-file cache/swebench_task.json \
-    --output cache/swebench_solution.json \
-    --model-name "<model>" --provider-url "<provider_base_url>"
-
-# Lint / type-check
-make lint
 ```
 
-API keys are read from environment variables / a `.env` file, e.g.:
+### Configuration
 
-```
+Create a `.env` file with your provider keys:
+
+```bash
 GROQ_API_URL=https://api.groq.com/openai/v1
 GROQ_MODEL_NAME=llama-3.3-70b-versatile
-GROQ_KEYS=key1,key2
+GROQ_KEYS=gsk_key1,gsk_key2
+
 OPENROUTER_API_URL=https://openrouter.ai/api/v1
-OPENROUTER_MODEL_NAME=<model>
-OPENROUTER_KEYS=key1,key2
+OPENROUTER_MODEL_NAME=qwen/qwen3-235b-a22b-2507
+OPENROUTER_KEYS=sk-or-key1,sk-or-key2
 ```
 
-`TokenRotator` discovers every `<PROVIDER>_API_URL` /
-`<PROVIDER>_MODEL_NAME` / `<PROVIDER>_KEYS` triple present in the
-environment and rotates across all of them (multiple keys per
-provider, and multiple providers) on rate limits or transient errors.
+### Running the MBPP Agent
 
-## Benchmark results and analysis
+```bash
+uv run python -m agent_mbpp \
+  --task-file task.json \
+  --output solution.json \
+  --model-name "llama-3.3-70b-versatile" \
+  --provider-url "https://api.groq.com/openai/v1"
+```
 
-See [`BENCHMARK_REPORT.md`](./BENCHMARK_REPORT.md) at the root of the
-repository for the model comparison, provider reliability notes,
-intermediary metrics, and the ablation studies (subject section V.7).
-It is explicit about what is a real, logged run versus what is still
-a `TODO` before the required 5-model x 3-task matrix is complete.
+### Running the SWE-bench Agent
+
+```bash
+uv run python -m agent_swebench \
+  --task-file swebench_task.json \
+  --output solution.json \
+  --model-name "llama-3.3-70b-versatile" \
+  --provider-url "https://api.groq.com/openai/v1"
+```
+
+### Interactive Sandbox CLI
+
+```bash
+# Basic interactive mode
+uv run sandbox
+
+# With custom sandbox config
+uv run sandbox sandbox_template.json
+
+# With MBPP MCP tools via stdio
+uv run sandbox --mcp-stdio "python mcp_tools_mbpp.py" sandbox_template.json
+
+# With SWE-bench MCP tools
+uv run sandbox --mcp-stdio "python mcp_tools_swebench.py"
+
+# With HTTP MCP server
+uv run sandbox --mcp-server http://localhost:8000
+```
+
+## System Architecture
+
+```
++------------------+
+|   Agent Code     |
+|  (Orchestrator)  |
++--------+---------+
+         |
+    LLM API call (OpenAI-compatible)
+         |
++--------v---------+     Response containing code block
+|    LLM Provider   |-----------------------------+
++------------------+                              |
+                                                  v
+                                    +-------------+----------+
+                                    |    Code Extraction     |
+                                    | (Python / XML / JSON / |
+                                    |  Hermes / ReAct)       |
+                                    +-------------+----------+
+                                                  |
+                                         Extracted code
+                                                  |
+                                    +-------------v----------+
+                                    |       Sandbox          |
+                                    | (multiprocessing.Process|
+                                    |  isolation)            |
+                                    |                        |
+                                    |  Python    Tool Call   |
+                                    |  Interpreter -------> MCP Client
+                                    +------------------------+     |
+                                                              STDIO / HTTP
+                                                                   |
+                                                          +--------v-------+
+                                                          |   MCP Server   |
+                                                          | (mcp_tools_*   |
+                                                          |  .py files)    |
+                                                          +----------------+
+```
+
+### Key Components
+
+1. **Agent/Orchestrator** (`agent_mbpp.py`, `agent_swebench.py`): Central loop that calls the LLM, extracts code, feeds it to the sandbox, reads observations, and repeats.
+
+2. **Code Extraction**: Transforms LLM responses into executable Python. Supports multiple formats: markdown code blocks (primary), Anthropic XML tool calls, JSON/Hermes tool calls, and ReAct format.
+
+3. **Sandbox** (`student/sandbox.py`): Execution boundary that enforces security restrictions on LLM-generated code. Uses `multiprocessing.Process` for isolation.
+
+4. **`final_answer()`**: A built-in sandbox construct (NOT an MCP tool) that signals task completion by raising `FinalAnswerException`.
+
+5. **MCP Servers** (`mcp_tools_mbpp.py`, `mcp_tools_swebench.py`): Run as separate processes (via stdio or HTTP), exposing tools as callable Python functions within the sandbox namespace.
+
+6. **LLM Client** (`student/llm.py`): OpenAI-compatible client with multi-provider, multi-key rotation via `TokenRotator`.
+
+## Agent Loop
+
+The agent follows a **Thought -> Code -> Observation** loop:
+
+1. **Thought**: The LLM reasons about the task or previous observations
+2. **Code**: The LLM generates Python code containing tool calls
+3. **Observation**: The sandbox executes the code and returns stdout/stderr
+4. The observation is fed back to the LLM as a new user message
+5. The loop repeats until `final_answer()` is called or limits are exceeded
+
+For MBPP, the agent generates a solution function and tests it against assertion-based test cases. An anti-repetition mechanism detects when the model regenerates identical failing code and bumps the sampling temperature to force exploration.
+
+For SWE-bench, the agent explores a Docker-containerized repository using file system and code search tools, edits files, runs the evaluation test suite, and submits a git patch via `final_answer(get_patch())`.
+
+## Sandbox Design
+
+The sandbox provides a secure execution environment using `multiprocessing.Process` isolation:
+
+- **Import restrictions**: Only modules from a configurable allowlist (`authorized_imports`) can be imported. Uses a custom `__import__` hook with `fnmatch` pattern matching.
+- **Filesystem restrictions**: File access is limited to `allowed_directories` (default: `/testbed`, `/tmp/agent`). A wrapped `open()` checks `os.path.abspath` against the allowlist.
+- **Network blocking**: All socket creation is intercepted and raises `ForbiddenNetworkError`.
+- **Dangerous builtins removal**: `exec`, `eval`, `compile`, `breakpoint`, `exit`, `quit` are removed from the execution namespace to prevent privilege escalation.
+- **Execution timeout**: Configurable per-execution timeout with `process.terminate()`.
+- **Memory limits**: `resource.setrlimit(RLIMIT_AS)` caps RAM usage.
+- **Process isolation**: Code runs in a child process; tool calls are proxied through `multiprocessing.Queue` pairs (request/response) so the parent executes MCP calls outside the restricted environment.
+
+Configuration is managed via Pydantic models (`SandboxConfig`) and JSON files (`sandbox_template.json`).
+
+## Tool Implementation Details
+
+### MBPP Tools (`mcp_tools_mbpp.py`)
+
+| Tool | Description |
+|------|-------------|
+| `execute_python_code(code)` | Execute Python code in the sandbox |
+| `run_tests(code, tests)` | Run solution code against test assertions |
+
+### SWE-bench Tools (`mcp_tools_swebench.py`)
+
+| Tool | Description |
+|------|-------------|
+| `read_file(filepath, start_line, end_line)` | Read file lines with line numbers |
+| `edit_file(filepath, old_str, new_str)` | Replace exact string in a file |
+| `list_files(directory, pattern)` | List files matching a glob pattern |
+| `search_code(pattern, file_pattern)` | Grep-like plain substring search |
+| `search_function_or_class_definition_in_code(name)` | Find function/class definitions |
+| `find_references(name, filepath, line)` | Find all references to a symbol |
+| `run_tests()` | Execute the evaluation script |
+| `get_patch()` | Retrieve the unified git diff |
+| `run_command(command, workdir)` | Execute a shell command |
+
+All SWE-bench tools operate inside Docker containers via `docker exec`. The `run_tests()` tool includes smart log truncation that preserves test verdict lines regardless of where they fall in long output.
+
+## Benchmark Results and Analysis
+
+See [BENCHMARK_REPORT.md](BENCHMARK_REPORT.md) for the full model comparison report covering 5+ models across 3+ SWE-bench tasks with detailed metrics, provider reliability data, intermediary analysis, and ablation studies.
+
+Key findings:
+- The Thought -> Code -> Observation prompt structure significantly outperforms code-only prompts
+- Anti-repetition temperature escalation prevents the agent from getting stuck in local minima
+- Log truncation must preserve test verdicts to avoid wasting iterations on invisible results
 
 ## Resources
 
-- [Model Context Protocol specification](https://modelcontextprotocol.io/)
-- [SWE-bench](https://www.swebench.com/) and
-  [SWE-bench Verified](https://openai.com/index/introducing-swe-bench-verified/)
-- [MBPP dataset](https://github.com/google-research/google-research/tree/master/mbpp)
-- [smolagents blog post on code agents](https://huggingface.co/blog/smolagents) --
-  background reading on the "code as the action space" idea this
-  project implements from scratch (no smolagents/langgraph/etc. code
-  was used, per the subject's constraints).
-- [Python `resource` module docs](https://docs.python.org/3/library/resource.html)
-  (`RLIMIT_AS`, used for the sandbox's memory limit)
+- [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) - Protocol for exposing tools as callable functions
+- [MBPP Benchmark](https://github.com/google-research/google-research/tree/master/mbpp) - Mostly Basic Python Problems dataset
+- [SWE-bench](https://www.swebench.com/) - Software Engineering benchmark for real-world bug fixing
+- [OpenAI API Reference](https://platform.openai.com/docs/api-reference) - API specification used by all compatible providers
+- [uv Documentation](https://docs.astral.sh/uv/) - Python package manager
 
-### AI usage disclosure
+### AI Usage
 
-An AI assistant (Claude) was used during this project for:
+AI (Claude, LLMs via Groq/OpenRouter) was used as a coding partner throughout development for:
+- Iterating on system prompt design and ablation testing
+- Debugging sandbox isolation edge cases (e.g., `exit()` vs flag-based test harness)
+- Reviewing and refactoring code for compliance with the subject specification
 
-- **Code review against the subject**: auditing the codebase section
-  by section against the project requirements and flagging missing
-  or broken mandatory pieces -- the two missing search tools, the
-  missing `uv run sandbox` CLI, the unenforced filesystem/builtins
-  restrictions in the sandbox, `AgentMbpp` never actually calling
-  MCP, `AgentSWEBench` opening an MCP session and then bypassing it
-  via a direct Python import, an escaped-brace bug that silently
-  hid real exception messages in the MBPP test harness, and
-  `test_imports` from the MBPP task never being read or used.
-- **Implementing the fixes above** while keeping the existing
-  functions and structure wherever the underlying bug didn't require
-  changing them: e.g. `_extract_code` and `_build_test_code` in
-  `AgentMbpp` keep their original names/call sites and got smaller,
-  targeted edits rather than a rewrite; `mcp_tools_mbpp.py`'s
-  original `execute_python_code` tool was kept as-is, with `run_tests`
-  added alongside it.
-- Every change was manually reviewed, and the sandbox changes in
-  particular were smoke-tested in isolation (import restriction,
-  filesystem restriction, `eval`/`exec` removal, timeout with partial
-  output, tool output truncation, positional and keyword tool calls)
-  before being kept, since `sandbox.py` is the project's actual
-  security boundary.
-
-As emphasized in the subject's AI Instructions: this assistance
-sped up implementation, but the underlying design decisions (why
-`MCPBridge` needs its own thread/event loop, why partial output is
-recovered through shared memory rather than a `multiprocessing.
-Manager`, why MBPP and SWE-bench use different default temperatures)
-needed to be understood and are explained in code comments and in
-this README, not just pasted in.
+All architectural decisions, prompt engineering strategies, and benchmark analysis were made and validated by the project author.

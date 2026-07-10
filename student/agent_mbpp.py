@@ -14,6 +14,7 @@ from json import JSONDecodeError
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
+from pydantic import ValidationError
 
 from student.agent_config import AgentConfig
 
@@ -63,9 +64,6 @@ class AgentMbpp:
         self.task_id: str = str(task_data.get("task_id", ""))
         self.prompt: str = str(task_data.get("task_definition", ""))
         self.tests: List[str] = list(task_data.get("test_list", []))
-        self.test_imports: List[str] = list(
-            task_data.get("test_imports", [])
-        )
         self.function_definition: str = str(
             task_data.get("function_definition", "")
         )
@@ -106,24 +104,54 @@ class AgentMbpp:
             "```"
         )
 
+        if self.config.max_iterations is not None:
+            self.max_attempts: int = self.config.max_iterations
+        else:
+            self.max_attempts = MAX_ATTEMPTS
+
         print(f"Model : {self.config.model_name}")
         print(f"\n--- [Exercise {self.task_id}] ---")
         print(f"Prompt : {self.prompt}")
         print(f"Number of tests to validate: {len(self.tests)}")
 
     def _init_tools(self) -> Tuple[Any, Any]:
-        """Initialize the LLM client and connect to the MBPP MCP server.
+        """Initialize the LLM client and the sandbox.
 
         Returns:
-            Tuple[Any, Any]: The LLM client and a connected
-            ``MCPBridge`` exposing the MBPP tools (``run_tests``,
-            ``execute_python_code``) from mcp_tools_mbpp.py. That
-            server owns and configures its own ``Sandbox`` from
-            ``sandbox_template.json`` (see its ``_init_sandbox``) --
-            the sandbox boundary is enforced there.
+            Tuple[Any, Any]: The LLM client and the sandbox
+            instance used to run the agent loop.
         """
         from student.llm import LLMClient, TokenRotator
-        from student.mcp_bridge import MCPBridge
+        from student.sandbox import Sandbox
+        from student.sandbox_config import SandboxConfig
+
+        template_path: str = "sandbox_template.json"
+
+        if os.path.exists(template_path):
+            try:
+                with open(
+                    template_path, "r", encoding="utf-8"
+                ) as f:
+                    config_data: Dict[str, Any] = json.load(f)
+                sandbox_config: SandboxConfig = SandboxConfig(
+                    **config_data
+                )
+                print(
+                    "Sandbox loaded with custom config from "
+                    f"{template_path}"
+                )
+            except (OSError, JSONDecodeError, ValidationError) as e:
+                print(
+                    f"Failed to parse {template_path} ({e}). "
+                    "Using default sandbox limits."
+                )
+                sandbox_config = SandboxConfig()
+        else:
+            print(
+                f"{template_path} not found. Using default "
+                "sandbox limits."
+            )
+            sandbox_config = SandboxConfig()
 
         # TokenRotator reads its own provider keys directly from
         # the environment (GROQ_KEYS, OPENROUTER_KEYS, ...). There
@@ -139,10 +167,9 @@ class AgentMbpp:
             temperature=MBPP_TEMPERATURE,
         )
 
-        bridge = MCPBridge()
-        bridge.connect_stdio(f"{sys.executable} mcp_tools_mbpp.py")
+        sandbox: Any = Sandbox(sandbox_config)
 
-        return llm, bridge
+        return llm, sandbox
 
     def _build_test_code(self) -> str:
         """Build the test harness appended to the LLM's solution.
@@ -160,9 +187,7 @@ class AgentMbpp:
             str: The Python source to append to the candidate
             solution before sandboxed execution.
         """
-        lines: List[str] = list(self.test_imports) + [
-            "", "__all_tests_passed = True"
-        ]
+        lines: List[str] = ["", "__all_tests_passed = True"]
 
         for test_assert in self.tests:
             lines.append("try:")
@@ -175,7 +200,7 @@ class AgentMbpp:
             lines.append("except Exception as e:")
             lines.append(
                 f"    print(f'Runtime Error during [ {test_assert} ]: "
-                "{type(e).__name__}: {e}')"
+                "{{type(e).__name__}}: {{e}}')"
             )
             lines.append("    __all_tests_passed = False")
 
@@ -239,23 +264,21 @@ class AgentMbpp:
 
     @staticmethod
     def _extract_code(raw_text: str) -> str:
-        """Extract the candidate Python source from raw LLM output.
-
-        Delegates to ``student.code_extraction`` so the agent also
-        accepts XML ``<invoke>``, JSON ``<tool_call>``, and ReAct
-        tool-call formats besides fenced ```python blocks (subject
-        section V.1.2), instead of only stripping a markdown fence.
+        """Strip an optional markdown code fence from LLM output.
 
         Args:
             raw_text: The raw text returned by the LLM.
 
         Returns:
-            str: The candidate Python source, or ``""`` if nothing
-            usable was found in ``raw_text``.
+            str: The candidate Python source, stripped of any
+            surrounding markdown fence and whitespace.
         """
-        from student.code_extraction import extract_code
-
-        return extract_code(raw_text).code
+        code = raw_text
+        if "```python" in code:
+            code = code.split("```python")[1].split("```")[0]
+        elif "```" in code:
+            code = code.split("```")[1].split("```")[0]
+        return code.strip()
 
     @staticmethod
     def _is_same_code(code_a: str, code_b: str) -> bool:
@@ -286,15 +309,13 @@ class AgentMbpp:
         return _normalize(code_a) == _normalize(code_b)
 
     def _run_evaluation_loop(
-        self, llm: Any, bridge: Any
+        self, llm: Any, sandbox: Any
     ) -> Tuple[bool, str, int, int, List[Dict[str, Any]]]:
         """Run the Thought -> Code -> Observation loop.
 
         Args:
             llm: The LLM client used to request candidate code.
-            bridge: The connected ``MCPBridge`` used to validate
-                each candidate through the MBPP server's
-                ``run_tests`` tool.
+            sandbox: The sandbox used to execute candidate code.
 
         Returns:
             Tuple containing: whether the task was solved, the
@@ -302,21 +323,6 @@ class AgentMbpp:
             the total completion tokens used, and the per-step
             metrics.
         """
-        test_imports_note = (
-            f"\n\nThe test assertions run in the SAME namespace as "
-            f"your code and rely on these imports:\n"
-            f"{chr(10).join(self.test_imports)}\n"
-            "(already guaranteed to be present, no need to "
-            "re-import them, but don't shadow these names)."
-            if self.test_imports
-            else (
-                "\n\nNo test_imports were provided for this task: "
-                "if a test assertion uses a module (e.g. "
-                "math.isclose(...), cmath.phase(...)), YOUR code "
-                "must import it yourself, since the assertions run "
-                "in the same namespace as your code."
-            )
-        )
         messages_context: List[Dict[str, str]] = [
             {"role": "system", "content": self.system_prompt},
             {
@@ -324,8 +330,7 @@ class AgentMbpp:
                 "content": (
                     f"Problem statement:\n{self.prompt}\n\n"
                     "You MUST use this exact function "
-                    f"signature:\n{self.function_definition}"
-                    f"{test_imports_note}\n\n"
+                    f"signature:\n{self.function_definition}\n\n"
                     "Note: parameter names in the signature may "
                     "not be self-explanatory (e.g. a short name "
                     "could mean a count, a length, or a ratio) - "
@@ -347,8 +352,8 @@ class AgentMbpp:
         last_failed_code: str = ""
         repeat_streak: int = 0
 
-        for attempt in range(1, MAX_ATTEMPTS + 1):
-            print(f"--- Attempt {attempt} / {MAX_ATTEMPTS} ---")
+        for attempt in range(1, self.max_attempts + 1):
+            print(f"--- Attempt {attempt} / {self.max_attempts} ---")
 
             call_temperature: Optional[float] = None
             if repeat_streak > 0:
@@ -393,15 +398,10 @@ class AgentMbpp:
             test_code = self._build_test_code()
             final_code: str = raw_code + "\n" + test_code
 
-            try:
-                log = str(
-                    bridge.call_tool("run_tests", {"code": final_code})
-                )
-            except Exception as e:
-                log = (
-                    "MCP Error: failed to call the run_tests tool "
-                    f"({type(e).__name__}: {e})."
-                )
+            sandbox_result: Dict[str, Any] = sandbox.execute_code(
+                final_code
+            )
+            log: str = str(sandbox_result.get("output", ""))
             success = "ALL_TESTS_PASSED" in log
 
             steps.append(
@@ -445,6 +445,9 @@ class AgentMbpp:
                 )
 
             messages_context.append(
+                {"role": "assistant", "content": llm_output}
+            )
+            messages_context.append(
                 {"role": "user", "content": feedback}
             )
 
@@ -458,21 +461,18 @@ class AgentMbpp:
 
     def solve(self) -> None:
         """Run the agent end to end and persist the report."""
-        llm, bridge = self._init_tools()
+        llm, sandbox = self._init_tools()
 
-        try:
-            start_agent: float = time.time()
-            (
-                success,
-                raw_code,
-                prompt_tokens,
-                completion_tokens,
-                steps,
-            ) = self._run_evaluation_loop(llm, bridge)
-            end_agent: float = time.time()
-            total_time: float = end_agent - start_agent
-        finally:
-            bridge.close()
+        start_agent: float = time.time()
+        (
+            success,
+            raw_code,
+            prompt_tokens,
+            completion_tokens,
+            steps,
+        ) = self._run_evaluation_loop(llm, sandbox)
+        end_agent: float = time.time()
+        total_time: float = end_agent - start_agent
 
         self._save_report(
             success,
