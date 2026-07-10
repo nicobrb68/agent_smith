@@ -368,9 +368,14 @@ class AgentMbpp:
                 )
 
             start_api: float = time.time()
-            api_answer: Dict[str, Any] = llm.call_api(
-                messages_context, temperature=call_temperature
-            )
+            try:
+                api_answer: Dict[str, Any] = llm.call_api(
+                    messages_context,
+                    temperature=call_temperature,
+                )
+            except RuntimeError as e:
+                print(f"LLM API error: {e}")
+                break
             end_api: float = time.time()
             request_time_ms: float = (end_api - start_api) * 1000
 
