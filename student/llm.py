@@ -27,7 +27,10 @@ class TokenRotator:
 
     def _load_providers(self) -> None:
         """Discover provider configurations from the .env file."""
-        providers = ["GROQ", "OPENROUTER", "GEMINI", "OPENAI"]
+        providers = [
+            "GROQ", "OPENROUTER", "GEMINI",
+            "OPENAI", "MISTRAL",
+        ]
 
         for p in providers:
             url = os.getenv(f"{p}_API_URL")
@@ -140,26 +143,19 @@ class LLMClient:
         for _ in range(len(self.rotator.configs)):
             config = self.rotator.get_current_config()
 
-            is_cli_compatible = True
             key = config["key"]
-            if (
+            cli_matches_provider = (
                 self.cli_url
-                and "groq" in self.cli_url.lower()
-                and key.startswith("sk-or")
-            ):
-                is_cli_compatible = False
-            elif (
-                self.cli_url
-                and "openrouter" in self.cli_url.lower()
-                and key.startswith("gsk_")
-            ):
-                is_cli_compatible = False
-            elif key.startswith("AIza"):
-                is_cli_compatible = False
+                and config["url"]
+                and self.cli_url.rstrip("/").lower()
+                == config["url"].rstrip("/").lower()
+            )
 
-            if self.rotator.current_index == 0 and is_cli_compatible:
-                base_url = self.cli_url or config["url"]
-                model_to_use = self.cli_model or config["model"]
+            if cli_matches_provider:
+                base_url = self.cli_url
+                model_to_use = (
+                    self.cli_model or config["model"]
+                )
             else:
                 base_url = config["url"]
                 model_to_use = config["model"]
