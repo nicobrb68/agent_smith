@@ -84,15 +84,19 @@ def run_tests(code: str, tests: str) -> str:
     test_lines = [t.strip() for t in tests.strip().splitlines() if t.strip()]
     harness_parts = [code, "", "__all_tests_passed = True"]
     for t in test_lines:
+        safe = t.replace("\\", "\\\\").replace('"', '\\"')
         harness_parts.append("try:")
         harness_parts.append(f"    {t}")
         harness_parts.append("except AssertionError:")
-        harness_parts.append(f"    print('Assertion failed: {t}')")
+        harness_parts.append(
+            f'    print("Assertion failed: {safe}")'
+        )
         harness_parts.append("    __all_tests_passed = False")
         harness_parts.append("except Exception as e:")
         harness_parts.append(
-            f"    print(f'Runtime Error during [ {t} ]: "
-            "{type(e).__name__}: {e}')"
+            f'    print(f"Runtime Error during '
+            f'[ {safe} ]: '
+            '{type(e).__name__}: {e}")'
         )
         harness_parts.append("    __all_tests_passed = False")
     harness_parts.append("")

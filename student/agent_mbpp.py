@@ -190,17 +190,21 @@ class AgentMbpp:
         lines: List[str] = ["", "__all_tests_passed = True"]
 
         for test_assert in self.tests:
+            safe = test_assert.replace("\\", "\\\\").replace(
+                '"', '\\"'
+            )
             lines.append("try:")
             lines.append(f"    {test_assert}")
             lines.append("except AssertionError:")
             lines.append(
-                f"    print('Assertion failed: {test_assert}')"
+                f'    print("Assertion failed: {safe}")'
             )
             lines.append("    __all_tests_passed = False")
             lines.append("except Exception as e:")
             lines.append(
-                f"    print(f'Runtime Error during [ {test_assert} ]: "
-                "{{type(e).__name__}}: {{e}}')"
+                f'    print(f"Runtime Error during '
+                f'[ {safe} ]: '
+                '{type(e).__name__}: {e}")'
             )
             lines.append("    __all_tests_passed = False")
 
