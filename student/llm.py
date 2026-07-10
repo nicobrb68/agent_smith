@@ -167,7 +167,11 @@ class LLMClient:
                     "model": model_to_use,
                     "messages": messages,
                     "temperature": effective_temperature,
-                    "top_p": self.top_p,
+                    "top_p": (
+                        1.0
+                        if effective_temperature == 0.0
+                        else self.top_p
+                    ),
                     "max_tokens": self.max_tokens,
                 }
                 if tools:

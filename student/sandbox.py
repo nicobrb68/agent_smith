@@ -28,16 +28,23 @@ class Sandbox:
 
     def _apply_restrictions(self) -> None:
         """Internal method to activate security JUST BEFORE execution."""
-        limit_ram: int = self.config.max_memory_mb * 1024 * 1024
-        try:
-            resource.setrlimit(resource.RLIMIT_AS, (limit_ram, limit_ram))
-        except ValueError:
+        if self.config.max_memory_mb > 0:
+            limit_ram: int = (
+                self.config.max_memory_mb * 1024 * 1024
+            )
             try:
                 resource.setrlimit(
-                    resource.RLIMIT_AS, (limit_ram, resource.RLIM_INFINITY)
+                    resource.RLIMIT_AS,
+                    (limit_ram, limit_ram),
                 )
             except ValueError:
-                pass
+                try:
+                    resource.setrlimit(
+                        resource.RLIMIT_AS,
+                        (limit_ram, resource.RLIM_INFINITY),
+                    )
+                except ValueError:
+                    pass
 
         real_import = builtins.__import__
 
