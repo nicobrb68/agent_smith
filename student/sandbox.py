@@ -151,9 +151,31 @@ class Sandbox:
                     "output": get_print.getvalue(),
                     "solution": fae.answer,
                 })
+            except KeyboardInterrupt:
+                queue.put({
+                    "success": False,
+                    "is_final": False,
+                    "output": (
+                        f"{get_print.getvalue()}\n"
+                        "KeyboardInterrupt: "
+                        "Execution interrupted by user."
+                    ),
+                    "solution": "",
+                })
+                raise
+            except SystemExit as se:
+                queue.put({
+                    "success": False,
+                    "is_final": False,
+                    "output": (
+                        f"{get_print.getvalue()}\n"
+                        "SystemExit: Sandboxed code "
+                        f"called exit (code={se.code})."
+                    ),
+                    "solution": "",
+                })
+                raise
             except BaseException as e:
-                if isinstance(e, (KeyboardInterrupt, SystemExit)):
-                    raise e
                 queue.put({
                     "success": False,
                     "is_final": False,

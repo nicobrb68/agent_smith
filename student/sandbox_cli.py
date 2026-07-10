@@ -106,6 +106,9 @@ def _repl(sandbox: Sandbox, tools: Dict[str, Callable]) -> None:
         except EOFError:
             print("\nBye.")
             break
+        except KeyboardInterrupt:
+            print("\nKeyboardInterrupt — session ended.")
+            break
 
         code = "\n".join(lines).strip()
         if not code:

@@ -16,3 +16,5 @@ cache/
 # Dépôts SWE-bench clonés dynamiquement par l'agent
 sympy/
 django/
+
+.idea/
