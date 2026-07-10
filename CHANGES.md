@@ -17,6 +17,11 @@ All changes below were made starting from commit `38ebb2cfef5260c9a99525e19ac1a6
 
 **How it works:** The safe builtins dict is passed as `execution_globals["__builtins__"]`, so sandboxed code sees the restricted set. The `open()` wrapper resolves the absolute path and checks if it starts with any allowed directory path. If not, it raises `PathAccessError`.
 
+**Additional sandbox runtime fixes:**
+
+- **Multiprocessing start method**: on macOS with Python 3.10, the default start method is `spawn`, which tries to pickle the `agent_routine` closure — and fails (`Can't pickle local object`). Fixed by using `multiprocessing.get_context("fork")` to create the child process. `fork` clones the parent's memory space directly, no pickling needed.
+- **Memory limit graceful handling**: `resource.setrlimit(RLIMIT_AS, ...)` raises `ValueError` when the forked child already exceeds the target limit (it inherits the parent's memory footprint). Fixed by catching `ValueError` and falling back to a soft limit, then silently skipping if even that fails. On Linux (where the moulinette runs) the child starts leaner and this rarely triggers, but on macOS dev machines it's systematic.
+
 ---
 
 ## 2. PathAccessError (`student/errors.py`)
@@ -56,6 +61,15 @@ The `--max-iterations` flag is required by subject V.3 section 4: "max_iteration
 4. ReAct format (`Action: tool_name\nAction Input: {...}`)
 
 Non-Python formats are converted to equivalent `print(tool_name(...))` Python calls before sandbox execution.
+
+**Additional SWE-bench agent improvements (second pass):**
+
+- **System prompt rewritten** with a structured debugging methodology (UNDERSTAND -> LOCATE -> READ -> DIAGNOSE -> FIX -> VERIFY -> SUBMIT), a tool reference table, and a concrete example turn. The original prompt was too terse — just a tool list and 5 rules — which left the LLM guessing at methodology.
+- **"No code block found" feedback**: when the LLM responds without any recognized code format, the agent now sends an explicit error message telling it to use a ```python block, instead of passing raw text to the sandbox (which would fail with a confusing syntax error).
+- **Observation truncation**: observations longer than 15,000 chars are truncated (keep first half + last half) to preserve the 300k input token budget. Without this, a single `list_files` or `run_tests` call returning massive output could eat the entire budget.
+- **Time limit tracking**: the loop now checks elapsed time against 850s (leaving 50s margin before the 900s hard limit) and stops gracefully.
+- **Sandbox error prefix**: when `sandbox_res["success"]` is False, the observation is prefixed with `[SANDBOX ERROR]` so the LLM knows execution failed vs. produced output.
+- **Sandbox config loading**: now loads `sandbox_template.json` like the MBPP agent instead of using bare `SandboxConfig()` defaults.
 
 ---
 
@@ -145,6 +159,18 @@ Non-Python formats are converted to equivalent `print(tool_name(...))` Python ca
 - Conclusions with model selection rationale
 
 **Why:** Subject V.7 requires BENCHMARK_REPORT.md at repo root with >= 5 models on >= 3 SWE-bench tasks, including: Setup, Results table, Provider reliability, Intermediary metrics (>= 2), Ablation study, Conclusions.
+
+---
+
+## 13. Lint Compliance (all targets)
+
+**What changed:**
+- `student/agent_swebench.py`: rewrote all lines exceeding 79 characters (50+ E501 errors), extracted system prompt into `_build_prompt()` static method, extracted injected tools into `_build_injected_tools()` static method with proper `Callable` type annotations, added 2 blank lines before top-level `main()`, removed whitespace from blank lines, added type annotations to inner `_call` function (fixed mypy `no-untyped-def` and `arg-type` errors)
+- `student/sandbox_cli.py`: removed unused `import inspect` (F401)
+- `student/agent_mbpp.py`: added trailing newline (W292)
+- `mcp_tools_swebench.py`: added trailing newline (W292)
+
+**Why:** `make lint` runs `flake8` and `mypy --disallow-untyped-defs` on all targets. With 52 flake8 errors and 2 mypy errors, the moulinette's lint check was an automatic fail.
 
 ---
 

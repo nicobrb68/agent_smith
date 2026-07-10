@@ -3,7 +3,7 @@ from json import JSONDecodeError
 import os
 import sys
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 from datetime import datetime
 import re
 import asyncio
@@ -21,70 +21,161 @@ load_dotenv()
 
 
 class AgentSWEBench:
-    """Agent designed to solve complex SWE-bench issues autonomously using Docker."""
+    """Agent for solving SWE-bench issues autonomously."""
 
     def __init__(self) -> None:
-        """Initialize the agent, configuration, and load task data."""
+        """Initialize the agent and load task data."""
         self.config: AgentConfig = AgentConfig()
         try:
-            with open(self.config.task_file, "r", encoding="utf8") as f:
+            with open(
+                self.config.task_file, "r", encoding="utf8"
+            ) as f:
                 task_data: Dict[str, Any] = json.load(f)
         except (OSError, JSONDecodeError, TypeError) as e:
-            print(f"Error with the task file provided : {e}\nEnd of program.")
+            print(
+                f"Error with the task file provided : {e}\n"
+                "End of program."
+            )
             sys.exit(1)
 
-        self.task_id: str = str(task_data.get("instance_id", ""))
-        self.problem_statement: str = str(task_data.get("problem_statement", ""))
-        self.eval_script: str = str(task_data.get("eval_script", ""))
+        self.task_id: str = str(
+            task_data.get("instance_id", "")
+        )
+        self.problem_statement: str = str(
+            task_data.get("problem_statement", "")
+        )
+        self.eval_script: str = str(
+            task_data.get("eval_script", "")
+        )
         self.repo: str = str(task_data.get("repo", ""))
-        self.docker_image: str = str(task_data.get("docker_image", ""))
-        # SWEBenchTaskInput.hints_text (see subject, section V.4):
-        # legitimate task input provided by the moulinette itself,
-        # not something fetched externally, so the agent is allowed
-        # to use it. It may be empty for some instances.
-        self.hints_text: str = str(task_data.get("hints_text", ""))
+        self.docker_image: str = str(
+            task_data.get("docker_image", "")
+        )
+        self.hints_text: str = str(
+            task_data.get("hints_text", "")
+        )
 
         if self.config.max_iterations is not None:
-            self.max_iterations: int = self.config.max_iterations
+            self.max_iterations: int = (
+                self.config.max_iterations
+            )
         else:
             self.max_iterations = 30
 
-        # System prompt demandant l'encapsulation print() et le respect du pas-à-pas
-        self.system_prompt: str = (
-            "You are a Senior Software Engineer. Fix the provided GitHub issue using Python code blocks.\n\n"
-            "Available tools (MUST be wrapped in print()):\n"
-            "- read_file(filepath, start_line, end_line) -> str\n"
-            "- edit_file(filepath, old_str, new_str) -> str\n"
-            "- list_files(directory, pattern) -> str\n"
-            "- search_code(pattern, file_pattern) -> str\n"
-            "- search_function_or_class_definition_in_code(name) -> str\n"
-            "- find_references(name, filepath, line) -> str\n"
-            "- run_tests() -> str\n"
-            "- get_patch() -> str\n"
-            "- run_command(command, workdir) -> str\n"
-            "- final_answer(patch_str) -> None\n\n"
-            "STRICT PROTOCOL:\n"
-            "1. NO GUESSING. You must call search_code or read_file to inspect code BEFORE editing.\n"
-            "2. Execute exactly ONE tool call per turn inside a single ```python block, then wait.\n"
-            "3. NEVER pass empty strings or whitespace as old_str to edit_file.\n"
-            "4. IF A TEST FAILS: Analyze the error stack trace, read the breaking file, fix it, and re-run tests.\n"
-            "5. Submit ONLY when run_tests() passes 100% cleanly by calling final_answer(get_patch())."
-        )
+        self.system_prompt: str = self._build_prompt()
 
         print(f"Model : {self.config.model_name}")
         print(f"\n--- [SWE-bench Task {self.task_id}] ---")
         print(f"Docker Image : {self.docker_image}")
 
+    @staticmethod
+    def _build_prompt() -> str:
+        """Build the system prompt for the SWE-bench agent.
+
+        Returns:
+            str: The full system prompt string.
+        """
+        lines = [
+            "You are a Senior Software Engineer. Your "
+            "job is to fix the GitHub issue described "
+            "below inside a repository mounted at "
+            "/testbed.",
+            "",
+            "## Available Tools",
+            "Call tools inside a single ```python block."
+            " Each tool returns a string. Wrap every "
+            "call in print() so you can see the result.",
+            "",
+            "| Tool | Signature | Description |",
+            "| --- | --- | --- |",
+            "| read_file | read_file(filepath, "
+            "start_line, end_line) | Read file lines "
+            "(1-indexed, inclusive) with line numbers |",
+            "| edit_file | edit_file(filepath, old_str,"
+            " new_str) | Replace exact substring in a "
+            "file. old_str must be non-empty and exist "
+            "verbatim |",
+            "| list_files | list_files(directory, "
+            "pattern) | List files matching glob "
+            "(e.g. '*.py') |",
+            "| search_code | search_code(pattern, "
+            "file_pattern) | Plain substring search "
+            "(NOT regex). Shows path:line: content |",
+            "| search_function_or_class_definition_in"
+            "_code | search_function_or_class_definition"
+            "_in_code(name) | Find def/class definitions"
+            " by exact name |",
+            "| find_references | find_references(name, "
+            "filepath, line) | Find all usages of a "
+            "symbol |",
+            "| run_tests | run_tests() | Run the "
+            "evaluation test suite |",
+            "| get_patch | get_patch() | Get the unified"
+            " git diff of your changes |",
+            "| run_command | run_command(command, "
+            "workdir) | Run a shell command |",
+            "| final_answer | final_answer(patch_str) |"
+            " Submit your fix. Argument must be the "
+            "output of get_patch() |",
+            "",
+            "## Workflow",
+            "Follow this step-by-step debugging "
+            "methodology:",
+            "1. UNDERSTAND: Read the issue carefully. "
+            "Identify the symptom and likely area.",
+            "2. LOCATE: Use search_code or "
+            "search_function_or_class_definition_in_"
+            "code to find relevant code. Do NOT guess "
+            "file paths.",
+            "3. READ: Use read_file to examine the code"
+            " around the relevant area. Read enough "
+            "context (50-100 lines).",
+            "4. DIAGNOSE: Identify the root cause from "
+            "the code you read.",
+            "5. FIX: Use edit_file with the exact "
+            "old_str copied from read_file output. "
+            "Make minimal, targeted changes.",
+            "6. VERIFY: Run run_tests() to check if "
+            "your fix works.",
+            "7. SUBMIT: If tests pass, call "
+            "final_answer(get_patch()). If tests fail, "
+            "read the error, go back to step 3.",
+            "",
+            "## Rules",
+            "- ONE tool call per turn in a single "
+            "```python block, then STOP and wait for "
+            "the Observation.",
+            "- NEVER fabricate file paths or code "
+            "- always read first.",
+            "- NEVER pass empty or whitespace-only "
+            "old_str to edit_file.",
+            "- search_code uses PLAIN SUBSTRING "
+            "matching, not regex. Do not escape "
+            "characters.",
+            "- If you get stuck, try a different search"
+            " term or read a broader range of lines.",
+            "- Keep edits minimal - fix only what the "
+            "issue requires.",
+            "",
+            "## Example Turn",
+            "Thought: I need to find where "
+            "`validate_email` is defined.",
+            "```python",
+            "print(search_function_or_class_definition"
+            "_in_code('validate_email'))",
+            "```",
+        ]
+        return "\n".join(lines)
+
     def _init_tools(self) -> Tuple[Any, Sandbox]:
-        """Initialize the LLM client and Sandbox."""
+        """Initialize the LLM client and Sandbox.
+
+        Returns:
+            Tuple[Any, Sandbox]: The LLM client and sandbox.
+        """
         from student.llm import LLMClient, TokenRotator
 
         rotator = TokenRotator()
-        # Kept fully deterministic on purpose: this agent explores
-        # the repository through MCP tool calls (read_file,
-        # search_code, run_tests, ...) rather than by regenerating
-        # a whole solution from scratch, so determinism helps it
-        # follow the strict tool-use protocol without drifting.
         llm = LLMClient(
             rotator,
             self.config.provider_url,
@@ -92,9 +183,30 @@ class AgentSWEBench:
             temperature=0.0,
         )
 
-        sandbox_config = SandboxConfig()
-        sandbox: Sandbox = Sandbox(sandbox_config)
+        template_path: str = "sandbox_template.json"
+        if os.path.exists(template_path):
+            try:
+                with open(
+                    template_path, "r", encoding="utf-8"
+                ) as f:
+                    config_data: Dict[str, Any] = json.load(f)
+                sandbox_config = SandboxConfig(**config_data)
+                print(
+                    "Sandbox loaded with custom config "
+                    f"from {template_path}"
+                )
+            except (
+                OSError, JSONDecodeError, ValidationError
+            ) as e:
+                print(
+                    f"Failed to parse {template_path} "
+                    f"({e}). Using default sandbox limits."
+                )
+                sandbox_config = SandboxConfig()
+        else:
+            sandbox_config = SandboxConfig()
 
+        sandbox: Sandbox = Sandbox(sandbox_config)
         return llm, sandbox
 
     def _save_report(
@@ -106,12 +218,14 @@ class AgentSWEBench:
         total_time: float,
         steps: List[Dict[str, Any]],
     ) -> None:
-        """Save the final execution report matching SolutionOutput format."""
+        """Save the report matching SolutionOutput format."""
         output_data: Dict[str, Any] = {
             "task_id": str(self.task_id),
             "benchmark": "swebench",
             "success": bool(success),
-            "solution": str(final_patch) if final_patch else "",
+            "solution": (
+                str(final_patch) if final_patch else ""
+            ),
             "iterations": len(steps),
             "total_requests": len(steps),
             "total_input_tokens": int(prompt_tokens),
@@ -119,68 +233,103 @@ class AgentSWEBench:
             "total_time_seconds": float(total_time),
             "steps": steps,
             "system_prompt": self.system_prompt,
-            "error": None if success else "Agent failed to patch repository",
+            "error": (
+                None if success
+                else "Agent failed to patch repository"
+            ),
             "timestamp": datetime.now().isoformat(),
         }
 
         try:
             if os.path.dirname(self.config.output):
-                os.makedirs(os.path.dirname(self.config.output), exist_ok=True)
-            with open(self.config.output, "w", encoding="utf-8") as f:
+                os.makedirs(
+                    os.path.dirname(self.config.output),
+                    exist_ok=True,
+                )
+            with open(
+                self.config.output, "w", encoding="utf-8"
+            ) as f:
                 json.dump(output_data, f, indent=4)
-            print(f"Process finished. Output saved to {self.config.output}")
+            print(
+                "Process finished. Output saved to "
+                f"{self.config.output}"
+            )
         except OSError as e:
-            print(f"OS Error: Cannot write file to {self.config.output}: {e}")
+            print(
+                "OS Error: Cannot write file to "
+                f"{self.config.output}: {e}"
+            )
 
     @staticmethod
     def _extract_code(raw_text: str) -> str:
-        """Extract executable Python from multi-format LLM output.
+        """Extract executable Python from LLM output.
 
-        Supports: markdown fenced blocks, Anthropic XML tool_use,
-        JSON/Hermes tool_call, and ReAct Action/Action Input.
+        Supports: markdown fenced blocks, Anthropic XML
+        tool_use, JSON/Hermes tool_call, and ReAct format.
+
+        Args:
+            raw_text: Raw LLM output text.
+
+        Returns:
+            str: Extracted Python code.
         """
         python_blocks = re.findall(
-            r"```python\s*(.*?)\s*```", raw_text, re.DOTALL
+            r"```python\s*(.*?)\s*```",
+            raw_text, re.DOTALL,
         )
         if python_blocks:
             return "\n".join(python_blocks)
 
+        xml_pat = (
+            r"<tool_use>\s*<tool_name>\s*(\w+)\s*"
+            r"</tool_name>\s*<parameters>(.*?)"
+            r"</parameters>\s*</tool_use>"
+        )
         xml_match = re.search(
-            r"<tool_use>\s*<tool_name>\s*(\w+)\s*</tool_name>"
-            r"\s*<parameters>(.*?)</parameters>\s*</tool_use>",
-            raw_text, re.DOTALL,
+            xml_pat, raw_text, re.DOTALL,
         )
         if xml_match:
             tool_name = xml_match.group(1)
             params_block = xml_match.group(2).strip()
-            params = {}
+            params: Dict[str, str] = {}
             for pm in re.finditer(
-                r"<(\w+)>(.*?)</\1>", params_block, re.DOTALL
+                r"<(\w+)>(.*?)</\1>",
+                params_block, re.DOTALL,
             ):
                 params[pm.group(1)] = pm.group(2).strip()
             args = ", ".join(
-                f"{k}={repr(v)}" for k, v in params.items()
+                f"{k}={repr(v)}"
+                for k, v in params.items()
             )
             return f"print({tool_name}({args}))"
 
+        json_pat = (
+            r'"name"\s*:\s*"(\w+)".*?'
+            r'"arguments"\s*:\s*\{([^}]*)\}'
+        )
         json_match = re.search(
-            r'"name"\s*:\s*"(\w+)".*?"arguments"\s*:\s*\{([^}]*)\}',
-            raw_text, re.DOTALL,
+            json_pat, raw_text, re.DOTALL,
         )
         if json_match:
             tool_name = json_match.group(1)
             try:
-                args_obj = json.loads("{" + json_match.group(2) + "}")
+                args_obj = json.loads(
+                    "{" + json_match.group(2) + "}"
+                )
                 args = ", ".join(
-                    f"{k}={repr(v)}" for k, v in args_obj.items()
+                    f"{k}={repr(v)}"
+                    for k, v in args_obj.items()
                 )
                 return f"print({tool_name}({args}))"
             except (json.JSONDecodeError, ValueError):
                 pass
 
+        react_pat = (
+            r"Action\s*:\s*(\w+)\s*\n"
+            r"Action\s*Input\s*:\s*(.*?)(?:\n|$)"
+        )
         react_match = re.search(
-            r"Action\s*:\s*(\w+)\s*\nAction\s*Input\s*:\s*(.*?)(?:\n|$)",
-            raw_text, re.DOTALL,
+            react_pat, raw_text, re.DOTALL,
         )
         if react_match:
             tool_name = react_match.group(1)
@@ -189,39 +338,127 @@ class AgentSWEBench:
                 args_obj = json.loads(action_input)
                 if isinstance(args_obj, dict):
                     args = ", ".join(
-                        f"{k}={repr(v)}" for k, v in args_obj.items()
+                        f"{k}={repr(v)}"
+                        for k, v in args_obj.items()
                     )
-                    return f"print({tool_name}({args}))"
+                    return (
+                        f"print({tool_name}({args}))"
+                    )
             except (json.JSONDecodeError, ValueError):
-                return f"print({tool_name}({repr(action_input)}))"
+                return (
+                    f"print({tool_name}"
+                    f"({repr(action_input)}))"
+                )
 
         return raw_text
 
+    @staticmethod
+    def _build_injected_tools() -> Dict[
+        str, Callable[..., Any]
+    ]:
+        """Build the dict of tools injected into sandbox.
+
+        Returns:
+            Dict mapping tool names to callables.
+        """
+        import mcp_tools_swebench as mtools
+
+        def _call(
+            func: Callable[..., Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            res = func(*args, **kwargs)
+            print(res)
+            return res
+
+        tools: Dict[str, Callable[..., Any]] = {
+            "read_file": lambda fp, sl, el: _call(
+                mtools.read_file, fp, sl, el,
+            ),
+            "edit_file": lambda fp, os_, ns: _call(
+                mtools.edit_file, fp, os_, ns,
+            ),
+            "list_files": lambda d=".", p="*": _call(
+                mtools.list_files, d, p,
+            ),
+            "search_code": lambda pt, fp="*.py": _call(
+                mtools.search_code, pt, fp,
+            ),
+            "run_tests": lambda: _call(
+                mtools.run_tests,
+            ),
+            "get_patch": lambda: _call(
+                mtools.get_patch,
+            ),
+            "run_command": lambda cmd, wd=".": _call(
+                mtools.run_command, cmd, wd,
+            ),
+            "search_function_or_class_definition"
+            "_in_code": lambda nm: _call(
+                mtools.search_function_or_class_definition_in_code,
+                nm,
+            ),
+            "find_references": lambda nm, fp="", ln=0: (
+                _call(
+                    mtools.find_references, nm, fp, ln,
+                )
+            ),
+        }
+        return tools
+
     async def _run_evaluation_loop(
-        self, llm: Any, sandbox: Sandbox, mcp_client: Any, loop: Any
-    ) -> Tuple[bool, str, int, int, List[Dict[str, Any]]]:
-        """Run the main software engineering loop using Sandbox execution."""
+        self,
+        llm: Any,
+        sandbox: Sandbox,
+        mcp_client: Any,
+        loop: Any,
+    ) -> Tuple[
+        bool, str, int, int, List[Dict[str, Any]]
+    ]:
+        """Run the main SWE-bench agent loop.
+
+        Args:
+            llm: The LLM client.
+            sandbox: The sandbox instance.
+            mcp_client: The MCP client session.
+            loop: The asyncio event loop.
+
+        Returns:
+            Tuple of success, patch, prompt tokens,
+            completion tokens, and step metrics.
+        """
         hint_block = ""
         if self.hints_text.strip():
             hint_block = (
-                "\n\nHint (optional, provided with the task - it "
-                "may point you in the right direction, but you "
-                "must still follow the STRICT PROTOCOL: read/"
-                "search the actual code before editing, do not "
-                "assume the hint alone is sufficient):\n"
+                "\n\nHint (optional, provided with "
+                "the task - it may point you in the "
+                "right direction, but you must still "
+                "follow the STRICT PROTOCOL: read/"
+                "search the actual code before "
+                "editing, do not assume the hint "
+                "alone is sufficient):\n"
                 f"{self.hints_text}"
             )
 
+        user_msg = (
+            f"Repository: {self.repo}\n"
+            "Note: You are already placed at the root "
+            "of the repository directory (/testbed).\n"
+            "All paths should be relative to the "
+            "current directory (e.g., use "
+            "'django/forms/widgets.py').\n\n"
+            "Issue Description:\n"
+            f"{self.problem_statement}"
+            f"{hint_block}"
+        )
+
         messages_context: List[Dict[str, Any]] = [
-            {"role": "system", "content": self.system_prompt},
             {
-                "role": "user",
-                "content": f"Repository: {self.repo}\n"
-                           f"Note: You are already placed at the root of the repository directory (/testbed).\n"
-                           f"All paths should be relative to the current directory (e.g., use 'django/forms/widgets.py').\n\n"
-                           f"Issue Description:\n{self.problem_statement}"
-                           f"{hint_block}",
+                "role": "system",
+                "content": self.system_prompt,
             },
+            {"role": "user", "content": user_msg},
         ]
         total_prompt_tokens: int = 0
         total_completion_tokens: int = 0
@@ -229,86 +466,171 @@ class AgentSWEBench:
         final_patch: str = ""
         steps: List[Dict[str, Any]] = []
 
-        import mcp_tools_swebench
+        injected_tools = self._build_injected_tools()
+        max_obs_chars: int = 15000
+        loop_start: float = time.time()
 
-        def call_and_print(func, *args, **kwargs):
-            res = func(*args, **kwargs)
-            print(res)
-            return res
+        for attempt in range(
+            1, self.max_iterations + 1
+        ):
+            elapsed = time.time() - loop_start
+            if elapsed > 850:
+                print(
+                    "Approaching 900s time limit. "
+                    "Stopping agent."
+                )
+                break
 
-        # Redirection des proxies de la Sandbox vers nos outils Docker MCP découplés
-        injected_tools = {
-            "read_file": lambda filepath, start_line, end_line: call_and_print(
-                mcp_tools_swebench.read_file, filepath, start_line, end_line
-            ),
-            "edit_file": lambda filepath, old_str, new_str: call_and_print(
-                mcp_tools_swebench.edit_file, filepath, old_str, new_str
-            ),
-            "list_files": lambda directory=".", pattern="*": call_and_print(
-                mcp_tools_swebench.list_files, directory, pattern
-            ),
-            "search_code": lambda pattern, file_pattern="*.py": call_and_print(
-                mcp_tools_swebench.search_code, pattern, file_pattern
-            ),
-            "run_tests": lambda: call_and_print(
-                mcp_tools_swebench.run_tests
-            ),
-            "get_patch": lambda: call_and_print(
-                mcp_tools_swebench.get_patch
-            ),
-            "run_command": lambda command, workdir=".": call_and_print(
-                mcp_tools_swebench.run_command, command, workdir
-            ),
-            "search_function_or_class_definition_in_code": lambda name: call_and_print(
-                mcp_tools_swebench.search_function_or_class_definition_in_code, name
-            ),
-            "find_references": lambda name, filepath="", line=0: call_and_print(
-                mcp_tools_swebench.find_references, name, filepath, line
-            ),
-        }
-
-        for attempt in range(1, self.max_iterations + 1):
-            print(f"--- SWE-bench Attempt {attempt} / {self.max_iterations} ---")
+            print(
+                f"--- SWE-bench Attempt {attempt}"
+                f" / {self.max_iterations} ---"
+            )
 
             start_api: float = time.time()
             try:
-                api_answer = llm.call_api(messages_context, tools=None)
+                api_answer = llm.call_api(
+                    messages_context, tools=None,
+                )
             except RuntimeError as e:
                 print(e)
                 break
-                
+
             end_api: float = time.time()
-            request_time_ms: float = (end_api - start_api) * 1000
+            request_time_ms: float = (
+                (end_api - start_api) * 1000
+            )
 
-            step_input_tokens: int = api_answer.get("prompt_tokens", 0)
-            step_output_tokens: int = api_answer.get("completion_tokens", 0)
-            total_prompt_tokens += step_input_tokens
-            total_completion_tokens += step_output_tokens
+            step_in: int = api_answer.get(
+                "prompt_tokens", 0,
+            )
+            step_out: int = api_answer.get(
+                "completion_tokens", 0,
+            )
+            total_prompt_tokens += step_in
+            total_completion_tokens += step_out
 
-            if total_prompt_tokens > 300000 or total_completion_tokens > 10000:
-                print("Hard limits exceeded (Tokens)! Stopping agent.")
+            if (
+                total_prompt_tokens > 300000
+                or total_completion_tokens > 10000
+            ):
+                print(
+                    "Hard limits exceeded (Tokens)! "
+                    "Stopping agent."
+                )
                 break
 
             llm_text = api_answer.get("text", "")
             code_to_run = self._extract_code(llm_text)
+            cfg = llm.rotator.get_current_config()
+
+            has_code = (
+                "```python" in llm_text
+                or "<tool_use>" in llm_text
+                or '"name"' in llm_text
+                or "Action:" in llm_text
+            )
+
+            if not has_code:
+                observation = (
+                    "No valid code block found in "
+                    "your response. You MUST respond "
+                    "with a ```python block containing"
+                    " exactly one tool call wrapped in"
+                    " print(). Example:\n"
+                    "```python\n"
+                    "print(search_code("
+                    "'some_function'))\n"
+                    "```"
+                )
+                messages_context.append(
+                    {
+                        "role": "assistant",
+                        "content": llm_text,
+                    }
+                )
+                messages_context.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Observation:\n"
+                            f"{observation}"
+                        ),
+                    }
+                )
+                steps.append({
+                    "step": attempt,
+                    "input_tokens": step_in,
+                    "output_tokens": step_out,
+                    "request_time_ms": request_time_ms,
+                    "timestamp": (
+                        datetime.now().isoformat()
+                    ),
+                    "api_url": cfg["url"],
+                    "model_name": cfg["model"],
+                    "llm_output": llm_text,
+                    "sandbox_input": "",
+                    "sandbox_output": observation,
+                    "retries": 0,
+                })
+                continue
 
             print("Executing code in Sandbox...")
-            sandbox_res = sandbox.execute_code(code_to_run.strip(), injected_tools=injected_tools)
-            
-            observation = sandbox_res.get("output", "")
-            is_final = sandbox_res.get("is_final", False)
+            sandbox_res = sandbox.execute_code(
+                code_to_run.strip(),
+                injected_tools=injected_tools,
+            )
 
-            messages_context.append({"role": "assistant", "content": llm_text})
-            messages_context.append({"role": "user", "content": f"Observation from sandbox execution:\n{observation}"})
+            observation = sandbox_res.get("output", "")
+            is_final = sandbox_res.get(
+                "is_final", False,
+            )
+
+            if len(observation) > max_obs_chars:
+                half = max_obs_chars // 2
+                trunc_msg = (
+                    "\n\n... [TRUNCATED - output too "
+                    f"long, {len(observation)} chars "
+                    "total] ...\n\n"
+                )
+                observation = (
+                    observation[:half]
+                    + trunc_msg
+                    + observation[-half:]
+                )
+
+            if (
+                not sandbox_res.get("success")
+                and not is_final
+            ):
+                observation = (
+                    f"[SANDBOX ERROR]\n{observation}"
+                )
+
+            messages_context.append(
+                {
+                    "role": "assistant",
+                    "content": llm_text,
+                }
+            )
+            messages_context.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Observation:\n{observation}"
+                    ),
+                }
+            )
 
             steps.append({
                 "step": attempt,
-                "input_tokens": step_input_tokens,
-                "output_tokens": step_output_tokens,
+                "input_tokens": step_in,
+                "output_tokens": step_out,
                 "request_time_ms": request_time_ms,
-                "timestamp": datetime.now().isoformat(),
-                "api_url": llm.rotator.get_current_config()["url"],
-                "model_name": llm.rotator.get_current_config()["model"],
+                "timestamp": (
+                    datetime.now().isoformat()
+                ),
+                "api_url": cfg["url"],
+                "model_name": cfg["model"],
                 "llm_output": llm_text,
                 "sandbox_input": code_to_run,
                 "sandbox_output": observation,
@@ -316,64 +638,109 @@ class AgentSWEBench:
             })
 
             if is_final:
-                final_patch = sandbox_res.get("solution", "").strip()
+                final_patch = sandbox_res.get(
+                    "solution", "",
+                ).strip()
                 success = "diff --git" in final_patch
                 if success:
-                    print("✅ L'IA a soumis un patch validé via final_answer() !")
+                    print(
+                        "Patch submitted via "
+                        "final_answer()."
+                    )
                     break
 
-        return (success, final_patch, total_prompt_tokens, total_completion_tokens, steps)
+        return (
+            success,
+            final_patch,
+            total_prompt_tokens,
+            total_completion_tokens,
+            steps,
+        )
 
     async def solve(self) -> None:
-        """Orchestrate container generation, execution, and systematic teardown."""
+        """Run the full SWE-bench agent pipeline."""
         llm, sandbox = self._init_tools()
 
-        # Définition d'un identifiant de conteneur unique et tracé
         container_name = f"agent_smith_{self.task_id}"
 
-        # Sauvegarde persistante du nom du conteneur pour le serveur MCP
         try:
-            with open(".container_id", "w", encoding="utf-8") as f:
+            with open(
+                ".container_id", "w", encoding="utf-8",
+            ) as f:
                 f.write(container_name)
         except OSError as e:
             print(f"Error: {e}")
             sys.exit(1)
-        # Nettoyage préventif d'une éventuelle instance orpheline
-        subprocess.run(f"docker rm -f {container_name}", shell=True, capture_output=True)
 
-        print(f"📥 Instanciation du conteneur isolé : {container_name}...")
-        start_res = subprocess.run([
-            "docker", "run", "-d",
-            "--name", container_name,
-            self.docker_image,
-            "tail", "-f", "/dev/null"
-        ], capture_output=True, text=True)
+        subprocess.run(
+            f"docker rm -f {container_name}",
+            shell=True, capture_output=True,
+        )
+
+        print(
+            "Instanciation du conteneur : "
+            f"{container_name}..."
+        )
+        start_res = subprocess.run(
+            [
+                "docker", "run", "-d",
+                "--name", container_name,
+                self.docker_image,
+                "tail", "-f", "/dev/null",
+            ],
+            capture_output=True, text=True,
+        )
 
         if start_res.returncode != 0:
-            print(f"Erreur fatale au lancement de Docker : {start_res.stderr}")
+            print(
+                "Erreur fatale Docker : "
+                f"{start_res.stderr}"
+            )
             sys.exit(1)
-            
-        print("📝 Injection du script de test officiel dans /testbed...")
+
+        print(
+            "Injection du script de test dans "
+            "/testbed..."
+        )
         subprocess.run(
-            ["docker", "exec", "-i", container_name, "bash", "-c", "cat > /testbed/eval_script.sh"],
+            [
+                "docker", "exec", "-i",
+                container_name, "bash", "-c",
+                "cat > /testbed/eval_script.sh",
+            ],
             input=self.eval_script,
             text=True,
-            capture_output=True
+            capture_output=True,
         )
-        subprocess.run(["docker", "exec", container_name, "chmod", "+x", "/testbed/eval_script.sh"], capture_output=True)
+        subprocess.run(
+            [
+                "docker", "exec", container_name,
+                "chmod", "+x",
+                "/testbed/eval_script.sh",
+            ],
+            capture_output=True,
+        )
 
         server_params = StdioServerParameters(
             command=sys.executable,
-            args=[os.path.abspath("mcp_tools_swebench.py")],
+            args=[
+                os.path.abspath(
+                    "mcp_tools_swebench.py"
+                ),
+            ],
             cwd=os.path.abspath("."),
-            stderr=sys.stderr
+            stderr=sys.stderr,
         )
 
         current_loop = asyncio.get_running_loop()
 
         try:
-            async with stdio_client(server_params) as (read_stream, write_stream):
-                async with ClientSession(read_stream, write_stream) as session:
+            async with stdio_client(
+                server_params,
+            ) as (read_stream, write_stream):
+                async with ClientSession(
+                    read_stream, write_stream,
+                ) as session:
                     await session.initialize()
 
                     start_agent = time.time()
@@ -383,20 +750,33 @@ class AgentSWEBench:
                         prompt_tokens,
                         completion_tokens,
                         steps,
-                    ) = await self._run_evaluation_loop(llm, sandbox, session, current_loop)
+                    ) = await self._run_evaluation_loop(
+                        llm, sandbox,
+                        session, current_loop,
+                    )
                     end_agent = time.time()
                     total_time = end_agent - start_agent
         finally:
-            # Garantie contractuelle absolue de nettoyage du conteneur après exécution
-            print(f"🧹 Fermeture et suppression du conteneur : {container_name}...")
-            subprocess.run(f"docker rm -f {container_name}", shell=True, capture_output=True)
+            print(
+                "Fermeture du conteneur : "
+                f"{container_name}..."
+            )
+            subprocess.run(
+                f"docker rm -f {container_name}",
+                shell=True, capture_output=True,
+            )
             if os.path.exists(".container_id"):
                 os.remove(".container_id")
 
-        self._save_report(success, final_patch, prompt_tokens, completion_tokens, total_time, steps)
+        self._save_report(
+            success, final_patch,
+            prompt_tokens, completion_tokens,
+            total_time, steps,
+        )
+
 
 def main() -> None:
-    """Main entry point to execute the SWE-bench agent."""
+    """Entry point for the SWE-bench agent."""
     agent: AgentSWEBench = AgentSWEBench()
     asyncio.run(agent.solve())
 
