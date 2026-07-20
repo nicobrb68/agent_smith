@@ -8,16 +8,100 @@ from datetime import datetime
 import re
 import asyncio
 import subprocess
+import threading
 
 from dotenv import load_dotenv
 from pydantic import ValidationError
 from student.agent_config import AgentConfig
 from student.sandbox import Sandbox
 from student.sandbox_config import SandboxConfig
-from mcp import stdio_client, StdioServerParameters
-from mcp.client.session import ClientSession
 
 load_dotenv()
+
+
+class _McpConnection:
+    """MCP session on a dedicated background event loop."""
+
+    def __init__(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop.run_forever, daemon=True,
+        )
+        self._thread.start()
+        self._session: Any = None
+        self._transport_cm: Any = None
+        self._session_cm: Any = None
+        self.tool_list: List[Any] = []
+
+    def connect_stdio(self, command: str, args: List[str],
+                      cwd: str) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            self._do_connect(command, args, cwd),
+            self._loop,
+        )
+        future.result(timeout=30)
+
+    async def _do_connect(self, command: str,
+                          args: List[str],
+                          cwd: str) -> None:
+        from mcp import StdioServerParameters, stdio_client
+        from mcp.client.session import ClientSession
+
+        params = StdioServerParameters(
+            command=command, args=args,
+            cwd=cwd, stderr=sys.stderr,
+        )
+        self._transport_cm = stdio_client(params)
+        r, w = await self._transport_cm.__aenter__()
+        self._session_cm = ClientSession(r, w)
+        self._session = (
+            await self._session_cm.__aenter__()
+        )
+        await self._session.initialize()
+        result = await self._session.list_tools()
+        self.tool_list = result.tools
+
+    def call_tool(
+        self, name: str, arguments: Dict[str, Any],
+    ) -> str:
+        future = asyncio.run_coroutine_threadsafe(
+            self._session.call_tool(
+                name, arguments=arguments,
+            ),
+            self._loop,
+        )
+        result = future.result(timeout=120)
+        parts: List[str] = []
+        for block in result.content:
+            if hasattr(block, "text"):
+                parts.append(block.text)
+        return "\n".join(parts) if parts else str(result)
+
+    def close(self) -> None:
+        async def _cleanup() -> None:
+            try:
+                if self._session_cm:
+                    await self._session_cm.__aexit__(
+                        None, None, None,
+                    )
+            except Exception:
+                pass
+            try:
+                if self._transport_cm:
+                    await self._transport_cm.__aexit__(
+                        None, None, None,
+                    )
+            except Exception:
+                pass
+
+        future = asyncio.run_coroutine_threadsafe(
+            _cleanup(), self._loop,
+        )
+        try:
+            future.result(timeout=5)
+        except Exception:
+            pass
+        self._loop.call_soon_threadsafe(self._loop.stop)
 
 
 class AgentSWEBench:
@@ -62,15 +146,58 @@ class AgentSWEBench:
         else:
             self.max_iterations = 30
 
-        self.system_prompt: str = self._build_prompt()
+        self.system_prompt: str = ""
 
         print(f"Model : {self.config.model_name}")
         print(f"\n--- [SWE-bench Task {self.task_id}] ---")
         print(f"Docker Image : {self.docker_image}")
 
     @staticmethod
-    def _build_prompt() -> str:
+    def _build_tool_table(
+        tool_list: List[Any],
+    ) -> str:
+        """Generate a markdown tool table from MCP schemas.
+
+        Args:
+            tool_list: MCP tool objects from list_tools().
+
+        Returns:
+            str: A markdown table documenting every tool.
+        """
+        rows: List[str] = [
+            "| Tool | Signature | Description |",
+            "| --- | --- | --- |",
+        ]
+        for tool in tool_list:
+            name = tool.name
+            schema = tool.inputSchema or {}
+            props = schema.get("properties", {})
+            required = set(schema.get("required", []))
+            params: List[str] = []
+            for pname, pinfo in props.items():
+                if pname in required:
+                    params.append(pname)
+                else:
+                    default = pinfo.get("default", "")
+                    params.append(
+                        f"{pname}={repr(default)}"
+                    )
+            sig = f"{name}({', '.join(params)})"
+            desc = (tool.description or "").split("\n")[0]
+            rows.append(f"| {name} | {sig} | {desc} |")
+        rows.append(
+            "| final_answer | final_answer(patch_str)"
+            " | Submit your fix. Argument must be the "
+            "output of get_patch() |"
+        )
+        return "\n".join(rows)
+
+    @staticmethod
+    def _build_prompt(tool_table: str) -> str:
         """Build the system prompt for the SWE-bench agent.
+
+        Args:
+            tool_table: Markdown table of available tools.
 
         Returns:
             str: The full system prompt string.
@@ -86,37 +213,7 @@ class AgentSWEBench:
             " Each tool returns a string. Wrap every "
             "call in print() so you can see the result.",
             "",
-            "| Tool | Signature | Description |",
-            "| --- | --- | --- |",
-            "| read_file | read_file(filepath, "
-            "start_line, end_line) | Read file lines "
-            "(1-indexed, inclusive) with line numbers |",
-            "| edit_file | edit_file(filepath, old_str,"
-            " new_str) | Replace exact substring in a "
-            "file. old_str must be non-empty and exist "
-            "verbatim |",
-            "| list_files | list_files(directory, "
-            "pattern) | List files matching glob "
-            "(e.g. '*.py') |",
-            "| search_code | search_code(pattern, "
-            "file_pattern) | Plain substring search "
-            "(NOT regex). Shows path:line: content |",
-            "| search_function_or_class_definition_in"
-            "_code | search_function_or_class_definition"
-            "_in_code(name) | Find def/class definitions"
-            " by exact name |",
-            "| find_references | find_references(name, "
-            "filepath, line) | Find all usages of a "
-            "symbol |",
-            "| run_tests | run_tests() | Run the "
-            "evaluation test suite |",
-            "| get_patch | get_patch() | Get the unified"
-            " git diff of your changes |",
-            "| run_command | run_command(command, "
-            "workdir) | Run a shell command |",
-            "| final_answer | final_answer(patch_str) |"
-            " Submit your fix. Argument must be the "
-            "output of get_patch() |",
+            tool_table,
             "",
             "## Workflow",
             "Follow this step-by-step debugging "
@@ -353,66 +450,50 @@ class AgentSWEBench:
         return raw_text
 
     @staticmethod
-    def _build_injected_tools() -> Dict[
-        str, Callable[..., Any]
-    ]:
-        """Build the dict of tools injected into sandbox.
+    def _build_mcp_tools(
+        conn: _McpConnection,
+    ) -> Dict[str, Callable[..., Any]]:
+        """Build sandbox tools that route through MCP.
+
+        Args:
+            conn: Active MCP connection on its own loop.
 
         Returns:
             Dict mapping tool names to callables.
         """
-        import mcp_tools_swebench as mtools
+        tools: Dict[str, Callable[..., Any]] = {}
 
-        def _call(
-            func: Callable[..., Any],
-            *args: Any,
-            **kwargs: Any,
-        ) -> Any:
-            res = func(*args, **kwargs)
-            print(res)
-            return res
+        for tool in conn.tool_list:
+            schema = tool.inputSchema or {}
+            props = schema.get("properties", {})
+            param_names = list(props.keys())
+            tname = tool.name
 
-        tools: Dict[str, Callable[..., Any]] = {
-            "read_file": lambda fp, sl, el: _call(
-                mtools.read_file, fp, sl, el,
-            ),
-            "edit_file": lambda fp, os_, ns: _call(
-                mtools.edit_file, fp, os_, ns,
-            ),
-            "list_files": lambda d=".", p="*": _call(
-                mtools.list_files, d, p,
-            ),
-            "search_code": lambda pt, fp="*.py": _call(
-                mtools.search_code, pt, fp,
-            ),
-            "run_tests": lambda: _call(
-                mtools.run_tests,
-            ),
-            "get_patch": lambda: _call(
-                mtools.get_patch,
-            ),
-            "run_command": lambda cmd, wd=".": _call(
-                mtools.run_command, cmd, wd,
-            ),
-            "search_function_or_class_definition"
-            "_in_code": lambda nm: _call(
-                mtools.search_function_or_class_definition_in_code,
-                nm,
-            ),
-            "find_references": lambda nm, fp="", ln=0: (
-                _call(
-                    mtools.find_references, nm, fp, ln,
-                )
-            ),
-        }
+            def _make_wrapper(
+                name: str, pnames: List[str],
+            ) -> Callable[..., Any]:
+                def wrapper(
+                    *args: Any, **kwargs: Any,
+                ) -> str:
+                    call_kwargs: Dict[str, Any] = dict(
+                        zip(pnames, args),
+                    )
+                    call_kwargs.update(kwargs)
+                    return conn.call_tool(
+                        name, call_kwargs,
+                    )
+                return wrapper
+
+            tools[tname] = _make_wrapper(
+                tname, param_names,
+            )
         return tools
 
-    async def _run_evaluation_loop(
+    def _run_evaluation_loop(
         self,
         llm: Any,
         sandbox: Sandbox,
-        mcp_client: Any,
-        loop: Any,
+        conn: _McpConnection,
     ) -> Tuple[
         bool, str, int, int, List[Dict[str, Any]]
     ]:
@@ -421,13 +502,19 @@ class AgentSWEBench:
         Args:
             llm: The LLM client.
             sandbox: The sandbox instance.
-            mcp_client: The MCP client session.
-            loop: The asyncio event loop.
+            conn: Active MCP connection.
 
         Returns:
             Tuple of success, patch, prompt tokens,
             completion tokens, and step metrics.
         """
+        tool_table = self._build_tool_table(
+            conn.tool_list,
+        )
+        self.system_prompt = self._build_prompt(
+            tool_table,
+        )
+
         hint_block = ""
         if self.hints_text.strip():
             hint_block = (
@@ -466,7 +553,7 @@ class AgentSWEBench:
         final_patch: str = ""
         steps: List[Dict[str, Any]] = []
 
-        injected_tools = self._build_injected_tools()
+        injected_tools = self._build_mcp_tools(conn)
         max_obs_chars: int = 15000
         loop_start: float = time.time()
 
@@ -657,7 +744,7 @@ class AgentSWEBench:
             steps,
         )
 
-    async def solve(self) -> None:
+    def solve(self) -> None:
         """Run the full SWE-bench agent pipeline."""
         llm, sandbox = self._init_tools()
 
@@ -721,42 +808,34 @@ class AgentSWEBench:
             capture_output=True,
         )
 
-        server_params = StdioServerParameters(
-            command=sys.executable,
-            args=[
-                os.path.abspath(
-                    "mcp_tools_swebench.py"
-                ),
-            ],
-            cwd=os.path.abspath("."),
-            stderr=sys.stderr,
-        )
-
-        current_loop = asyncio.get_running_loop()
-
+        conn = _McpConnection()
         try:
-            async with stdio_client(
-                server_params,
-            ) as (read_stream, write_stream):
-                async with ClientSession(
-                    read_stream, write_stream,
-                ) as session:
-                    await session.initialize()
+            conn.connect_stdio(
+                sys.executable,
+                [os.path.abspath(
+                    "mcp_tools_swebench.py"
+                )],
+                os.path.abspath("."),
+            )
+            print(
+                "MCP tools discovered: "
+                f"{[t.name for t in conn.tool_list]}"
+            )
 
-                    start_agent = time.time()
-                    (
-                        success,
-                        final_patch,
-                        prompt_tokens,
-                        completion_tokens,
-                        steps,
-                    ) = await self._run_evaluation_loop(
-                        llm, sandbox,
-                        session, current_loop,
-                    )
-                    end_agent = time.time()
-                    total_time = end_agent - start_agent
+            start_agent = time.time()
+            (
+                success,
+                final_patch,
+                prompt_tokens,
+                completion_tokens,
+                steps,
+            ) = self._run_evaluation_loop(
+                llm, sandbox, conn,
+            )
+            end_agent = time.time()
+            total_time = end_agent - start_agent
         finally:
+            conn.close()
             print(
                 "Fermeture du conteneur : "
                 f"{container_name}..."
@@ -778,7 +857,7 @@ class AgentSWEBench:
 def main() -> None:
     """Entry point for the SWE-bench agent."""
     agent: AgentSWEBench = AgentSWEBench()
-    asyncio.run(agent.solve())
+    agent.solve()
 
 
 if __name__ == "__main__":

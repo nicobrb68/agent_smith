@@ -1,0 +1,15 @@
+{
+    "task_id": "sympy__sympy-13480",
+    "benchmark": "swebench",
+    "success": false,
+    "solution": "",
+    "iterations": 18,
+    "total_requests": 18,
+    "total_input_tokens": 45891,
+    "total_output_tokens": 1204,
+    "total_time_seconds": 185.3,
+    "steps": [],
+    "system_prompt": "",
+    "error": "Agent failed to patch repository",
+    "timestamp": "2025-07-15T00:00:00"
+}

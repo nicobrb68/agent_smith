@@ -1,0 +1,15 @@
+{
+    "task_id": "pydata__xarray-4629",
+    "benchmark": "swebench",
+    "success": false,
+    "solution": "",
+    "iterations": 25,
+    "total_requests": 25,
+    "total_input_tokens": 78456,
+    "total_output_tokens": 2987,
+    "total_time_seconds": 380.2,
+    "steps": [],
+    "system_prompt": "",
+    "error": "Agent failed to patch repository",
+    "timestamp": "2025-07-15T00:00:00"
+}

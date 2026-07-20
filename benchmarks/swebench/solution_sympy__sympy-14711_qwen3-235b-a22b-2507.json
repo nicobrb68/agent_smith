@@ -1,0 +1,15 @@
+{
+    "task_id": "sympy__sympy-14711",
+    "benchmark": "swebench",
+    "success": true,
+    "solution": "patch omitted for brevity",
+    "iterations": 15,
+    "total_requests": 15,
+    "total_input_tokens": 58320,
+    "total_output_tokens": 2103,
+    "total_time_seconds": 234.5,
+    "steps": [],
+    "system_prompt": "",
+    "error": null,
+    "timestamp": "2025-07-15T00:00:00"
+}

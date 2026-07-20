@@ -1,0 +1,15 @@
+{
+    "task_id": "pydata__xarray-4629",
+    "benchmark": "swebench",
+    "success": true,
+    "solution": "patch omitted for brevity",
+    "iterations": 14,
+    "total_requests": 14,
+    "total_input_tokens": 48901,
+    "total_output_tokens": 2103,
+    "total_time_seconds": 175.6,
+    "steps": [],
+    "system_prompt": "",
+    "error": null,
+    "timestamp": "2025-07-15T00:00:00"
+}
