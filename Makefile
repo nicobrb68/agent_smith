@@ -4,7 +4,7 @@ FLAKE8 = uv run flake8
 MYPY = uv run mypy
 TARGETS = student main.py mcp_tools_mbpp.py mcp_tools_swebench.py
 
-.PHONY: all install lint lint-strict test-mbpp test-swebench clean dump-swebench dump-mbpp
+.PHONY: all install lint lint-strict test-mbpp test-swebench clean dump-swebench dump-mbpp docker-pull
 
 all: install
 
@@ -23,23 +23,27 @@ lint:
 		$(TARGETS)
 
 
+docker-pull:
+	@echo "Pulling python:3.11-slim..."
+	docker pull python:3.11-slim
+
 # Run a sample dump/eval cycle for MBPP based on subject CLI
-test-mbpp:
+test-mbpp: docker-pull
 	@echo "Running MBPP Agent environment check..."
 	mkdir -p cache
 	$(PYTHON) -m student.agent_mbpp --task-file cache/mbpp_task.json \
 		--output cache/mbpp_solution.json \
 		--model-name "llama-3.3-70b-versatile" \
-        --provider-url "https://api.groq.com/openai/v1"
+		--provider-url "https://api.groq.com/openai/v1"
 
 # Run a sample dump/eval cycle for SWE-bench based on subject CLI
-test-swebench:
+test-swebench: docker-pull
 	@echo "Running SWE-bench Agent environment check..."
 	mkdir -p cache
 	$(PYTHON) -m student.agent_swebench --task-file cache/swebench_task.json \
 		--output cache/swebench_solution.json \
 		--model-name "llama-3.3-70b-versatile" \
-        --provider-url "https://api.groq.com/openai/v1"
+		--provider-url "https://api.groq.com/openai/v1"
 
 clean:
 	@echo "Cleaning up caches and temporary files..."
