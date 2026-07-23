@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from pydantic import ValidationError
 
 from student.agent_config import AgentConfig
+from student.eval_logger import capture_stdio, write_evaluation
 
 load_dotenv()
 
@@ -108,6 +109,8 @@ class AgentMbpp:
             self.max_attempts: int = self.config.max_iterations
         else:
             self.max_attempts = MAX_ATTEMPTS
+
+        self.last_output_data: Optional[Dict[str, Any]] = None
 
         print(f"Model : {self.config.model_name}")
         print(f"\n--- [Exercise {self.task_id}] ---")
@@ -240,6 +243,7 @@ class AgentMbpp:
             "error": None if success else "Agent failed to validate code",
             "timestamp": datetime.now().isoformat(),
         }
+        self.last_output_data = output_data
 
         try:
             if os.path.dirname(self.config.output):
@@ -495,8 +499,21 @@ class AgentMbpp:
 
 def main() -> None:
     """Entry point used by ``python -m agent_mbpp``."""
-    agent: AgentMbpp = AgentMbpp()
-    agent.solve()
+    with capture_stdio() as (out_tee, err_tee):
+        agent: Optional[AgentMbpp] = None
+        try:
+            agent = AgentMbpp()
+            agent.solve()
+        finally:
+            if agent is not None and agent.last_output_data:
+                write_evaluation(
+                    "mbpp",
+                    agent.task_id,
+                    agent.config.task_file,
+                    agent.last_output_data,
+                    out_tee.getvalue(),
+                    err_tee.getvalue(),
+                )
 
 
 if __name__ == "__main__":

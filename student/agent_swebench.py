@@ -3,7 +3,7 @@ from json import JSONDecodeError
 import os
 import sys
 import time
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from datetime import datetime
 import re
 import asyncio
@@ -13,6 +13,7 @@ import threading
 from dotenv import load_dotenv
 from pydantic import ValidationError
 from student.agent_config import AgentConfig
+from student.eval_logger import capture_stdio, write_evaluation
 from student.sandbox import Sandbox
 from student.sandbox_config import SandboxConfig
 
@@ -147,6 +148,7 @@ class AgentSWEBench:
             self.max_iterations = 30
 
         self.system_prompt: str = ""
+        self.last_output_data: Optional[Dict[str, Any]] = None
 
         print(f"Model : {self.config.model_name}")
         print(f"\n--- [SWE-bench Task {self.task_id}] ---")
@@ -336,6 +338,7 @@ class AgentSWEBench:
             ),
             "timestamp": datetime.now().isoformat(),
         }
+        self.last_output_data = output_data
 
         try:
             if os.path.dirname(self.config.output):
@@ -856,8 +859,21 @@ class AgentSWEBench:
 
 def main() -> None:
     """Entry point for the SWE-bench agent."""
-    agent: AgentSWEBench = AgentSWEBench()
-    agent.solve()
+    with capture_stdio() as (out_tee, err_tee):
+        agent: Optional[AgentSWEBench] = None
+        try:
+            agent = AgentSWEBench()
+            agent.solve()
+        finally:
+            if agent is not None and agent.last_output_data:
+                write_evaluation(
+                    "swebench",
+                    agent.task_id,
+                    agent.config.task_file,
+                    agent.last_output_data,
+                    out_tee.getvalue(),
+                    err_tee.getvalue(),
+                )
 
 
 if __name__ == "__main__":

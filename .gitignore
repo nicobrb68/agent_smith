@@ -17,4 +17,8 @@ cache/
 sympy/
 django/
 
+# Generated outputs — subject forbids committing these (Ch. VIII)
+benchmarks/
+evaluations/
+
 .idea/
