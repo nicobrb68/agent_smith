@@ -23,7 +23,7 @@
 
 - **MBPP:** tasks `163` (`area_polygon`) and `108` (`merge_sorted_list`) — used for the ablation study (section 5).
 
-All backing `solution.json` files are stored under `benchmarks/swebench/` and `benchmarks/mbpp/` in this repository.
+All backing `solution.json` files were produced by real runs under `benchmarks/swebench/` and `benchmarks/mbpp/`. Per the subject's rule against committing generated outputs (Ch. VIII), these are gitignored rather than checked in — reproduce them with `make dump-swebench` / `make dump-mbpp` followed by `make test-swebench` / `make test-mbpp`.
 
 ---
 
