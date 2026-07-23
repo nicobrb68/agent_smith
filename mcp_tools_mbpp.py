@@ -85,6 +85,7 @@ def run_tests(code: str, tests: str) -> str:
     harness_parts = [code, "", "__all_tests_passed = True"]
     for t in test_lines:
         safe = t.replace("\\", "\\\\").replace('"', '\\"')
+        f_safe = safe.replace("{", "{{").replace("}", "}}")
         harness_parts.append("try:")
         harness_parts.append(f"    {t}")
         harness_parts.append("except AssertionError:")
@@ -95,7 +96,7 @@ def run_tests(code: str, tests: str) -> str:
         harness_parts.append("except Exception as e:")
         harness_parts.append(
             f'    print(f"Runtime Error during '
-            f'[ {safe} ]: '
+            f'[ {f_safe} ]: '
             '{type(e).__name__}: {e}")'
         )
         harness_parts.append("    __all_tests_passed = False")

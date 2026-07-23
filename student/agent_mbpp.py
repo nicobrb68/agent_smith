@@ -196,6 +196,7 @@ class AgentMbpp:
             safe = test_assert.replace("\\", "\\\\").replace(
                 '"', '\\"'
             )
+            f_safe = safe.replace("{", "{{").replace("}", "}}")
             lines.append("try:")
             lines.append(f"    {test_assert}")
             lines.append("except AssertionError:")
@@ -206,7 +207,7 @@ class AgentMbpp:
             lines.append("except Exception as e:")
             lines.append(
                 f'    print(f"Runtime Error during '
-                f'[ {safe} ]: '
+                f'[ {f_safe} ]: '
                 '{type(e).__name__}: {e}")'
             )
             lines.append("    __all_tests_passed = False")
