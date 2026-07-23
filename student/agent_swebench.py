@@ -768,7 +768,7 @@ class AgentSWEBench:
         )
 
         print(
-            "Instanciation du conteneur : "
+            "Starting container: "
             f"{container_name}..."
         )
         start_res = subprocess.run(
@@ -783,13 +783,13 @@ class AgentSWEBench:
 
         if start_res.returncode != 0:
             print(
-                "Erreur fatale Docker : "
+                "Fatal Docker error: "
                 f"{start_res.stderr}"
             )
             sys.exit(1)
 
         print(
-            "Injection du script de test dans "
+            "Injecting test script into "
             "/testbed..."
         )
         subprocess.run(
@@ -840,7 +840,7 @@ class AgentSWEBench:
         finally:
             conn.close()
             print(
-                "Fermeture du conteneur : "
+                "Stopping container: "
                 f"{container_name}..."
             )
             subprocess.run(

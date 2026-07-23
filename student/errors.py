@@ -1,20 +1,20 @@
 class AgentSmithError(Exception):
-    """Exception de base pour tout le projet Agent Smith."""
+    """Base exception for the whole Agent Smith project."""
     pass
 
 
 class SandboxError(AgentSmithError):
-    """Exception de base pour les erreurs liées à la sandbox."""
+    """Base exception for sandbox-related errors."""
     pass
 
 
 class UnauthorizedImportError(SandboxError):
-    """Levée lorsqu'un module non autorisé tente d'être importé."""
+    """Raised when an unauthorized module is imported."""
     pass
 
 
 class ForbiddenNetworkError(SandboxError):
-    """Levée lors d'une tentative d'accès réseau non autorisée."""
+    """Raised when an unauthorized network access is attempted."""
     pass
 
 
@@ -24,6 +24,6 @@ class PathAccessError(SandboxError):
 
 
 class FinalAnswerException(SandboxError):
-    """Exception interne pour intercepter l'appel à final_answer."""
+    """Internal exception used to intercept the final_answer call."""
     def __init__(self, answer: str):
         self.answer = answer
